@@ -1,0 +1,1010 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>AMD Rapido - Documentation</title>
+    <style>
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+
+        body {
+            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+            line-height: 1.6;
+            color: #333;
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            padding: 20px;
+        }
+
+        .container {
+            max-width: 1200px;
+            margin: 0 auto;
+            background: white;
+            border-radius: 10px;
+            box-shadow: 0 10px 40px rgba(0, 0, 0, 0.2);
+            overflow: hidden;
+        }
+
+        .header {
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            color: white;
+            padding: 40px;
+            text-align: center;
+        }
+
+        .header h1 {
+            font-size: 2.5rem;
+            margin-bottom: 10px;
+            font-weight: 700;
+        }
+
+        .header p {
+            font-size: 1.2rem;
+            opacity: 0.9;
+        }
+
+        .content {
+            padding: 40px;
+        }
+
+        h2 {
+            color: #667eea;
+            margin-top: 30px;
+            margin-bottom: 15px;
+            padding-bottom: 10px;
+            border-bottom: 2px solid #667eea;
+            font-size: 1.8rem;
+        }
+
+        h3 {
+            color: #764ba2;
+            margin-top: 20px;
+            margin-bottom: 10px;
+            font-size: 1.4rem;
+        }
+
+        h4 {
+            color: #667eea;
+            margin-top: 15px;
+            margin-bottom: 8px;
+            font-size: 1.1rem;
+        }
+
+        p {
+            margin-bottom: 15px;
+            text-align: justify;
+        }
+
+        .feature-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(250px, 1fr));
+            gap: 20px;
+            margin: 20px 0;
+        }
+
+        .feature-card {
+            background: linear-gradient(135deg, #f5f7fa 0%, #c3cfe2 100%);
+            padding: 20px;
+            border-radius: 8px;
+            border-left: 4px solid #667eea;
+        }
+
+        .feature-card h4 {
+            color: #667eea;
+            margin-bottom: 10px;
+            font-size: 1.1rem;
+        }
+
+        .code-block {
+            background: #2d2d2d;
+            color: #f8f8f2;
+            padding: 20px;
+            border-radius: 8px;
+            overflow-x: auto;
+            margin: 15px 0;
+            font-family: 'Courier New', monospace;
+            font-size: 0.9rem;
+            line-height: 1.5;
+        }
+
+        .code-block .comment {
+            color: #75715e;
+        }
+
+        .code-block .command {
+            color: #66d9ef;
+        }
+
+        .info-box {
+            background: #e3f2fd;
+            border-left: 4px solid #2196f3;
+            padding: 15px;
+            margin: 20px 0;
+            border-radius: 4px;
+        }
+
+        .warning-box {
+            background: #fff3e0;
+            border-left: 4px solid #ff9800;
+            padding: 15px;
+            margin: 20px 0;
+            border-radius: 4px;
+        }
+
+        .success-box {
+            background: #e8f5e9;
+            border-left: 4px solid #4caf50;
+            padding: 15px;
+            margin: 20px 0;
+            border-radius: 4px;
+        }
+
+        ul, ol {
+            margin-left: 30px;
+            margin-bottom: 15px;
+        }
+
+        li {
+            margin-bottom: 8px;
+        }
+
+        table {
+            width: 100%;
+            border-collapse: collapse;
+            margin: 20px 0;
+        }
+
+        table th,
+        table td {
+            padding: 12px;
+            border: 1px solid #ddd;
+            text-align: left;
+        }
+
+        table th {
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            color: white;
+            font-weight: 600;
+        }
+
+        table tr:nth-child(even) {
+            background: #f9f9f9;
+        }
+
+        .footer {
+            background: #f5f5f5;
+            padding: 30px;
+            text-align: center;
+            color: #666;
+            border-top: 1px solid #ddd;
+        }
+
+        .version {
+            display: inline-block;
+            background: #667eea;
+            color: white;
+            padding: 5px 15px;
+            border-radius: 20px;
+            font-size: 0.9rem;
+            margin-top: 10px;
+        }
+
+        a {
+            color: #667eea;
+            text-decoration: none;
+            font-weight: 600;
+        }
+
+        a:hover {
+            text-decoration: underline;
+        }
+
+        code {
+            background: #f4f4f4;
+            padding: 2px 6px;
+            border-radius: 3px;
+            font-family: 'Courier New', monospace;
+            font-size: 0.9em;
+        }
+
+        .new-badge {
+            display: inline-block;
+            background: #4caf50;
+            color: white;
+            padding: 2px 8px;
+            border-radius: 3px;
+            font-size: 0.75rem;
+            margin-left: 8px;
+            font-weight: 600;
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <div class="header">
+            <h1>AMD Rapido</h1>
+            <p>Server Hardware Information Collection & Comparison Tool</p>
+            <span class="version">Version 2.2</span>
+        </div>
+
+        <div class="content">
+            <h2>Overview</h2>
+            <p>
+                AMD Rapido is a comprehensive server hardware information collection and comparison toolkit designed
+                specifically for AMD GPU-equipped systems. It provides detailed hardware profiling including CPU, GPU,
+                networking, BMC, ROCm runtime, and GPU microbenchmark capabilities with an intuitive HTML-based comparison interface.
+            </p>
+
+            <div class="info-box">
+                <strong>Key Components:</strong>
+                <ul>
+                    <li><strong>rapido-collect.py</strong> - Collects hardware information and exports to JSON</li>
+                    <li><strong>rapido-report.py</strong> - Generates HTML comparison reports from JSON files</li>
+                    <li><strong>gpu_p2p_bandwidth.cpp</strong> - GPU-to-GPU peer-to-peer bandwidth benchmark (HIP)</li>
+                    <li><strong>gpu_kernel_benchmarks.cpp</strong> - Comprehensive GPU compute kernel benchmarks (GEMM, convolution, memory bandwidth)</li>
+                </ul>
+            </div>
+
+            <h2>What's New in Version 2.2 <span class="new-badge">NEW</span></h2>
+            <div class="success-box">
+                <strong>Latest Enhancements:</strong>
+                <ul>
+                    <li><strong>Selective Data Collection</strong> - New flags (-c, -g, -n, -b, -r, -m) to collect specific hardware sections only, reducing collection time</li>
+                    <li><strong>Dynamic Tab Visibility</strong> - Report tabs now only appear when data is available, providing cleaner UI</li>
+                    <li><strong>Conditional Report Titles</strong> - Report title shows "Comparison" only when comparing two devices</li>
+                    <li><strong>Enhanced Error Handling</strong> - Comprehensive JSON validation, crash protection, and partial data saving on interruption</li>
+                    <li><strong>Improved GPU Compatibility</strong> - Support for both old and new amd-smi JSON formats</li>
+                    <li><strong>Metadata Tracking</strong> - Collection status, timestamps, and error logging in JSON output</li>
+                </ul>
+            </div>
+
+            <h2>Version 2.1 Features</h2>
+            <div class="success-box">
+                <strong>Enhancements:</strong>
+                <ul>
+                    <li><strong>Tool Availability Check</strong> - Automatic detection of all required/optional tools at startup with clear impact reporting</li>
+                    <li><strong>GPU Kernel Benchmarks</strong> - Real-world performance testing including GEMM (FP32/FP64), memory bandwidth, vector operations, FMA throughput, and convolution</li>
+                    <li><strong>Renamed Script</strong> - rapido-compare.py renamed to rapido-report.py for better clarity</li>
+                </ul>
+            </div>
+
+            <h2>Version 2.0 Features</h2>
+            <div class="success-box">
+                <strong>Major Enhancements:</strong>
+                <ul>
+                    <li><strong>Enhanced GPU Tab</strong> - Comprehensive AMD GPU information using amd-smi including ASIC details, PCIe info, VBIOS, power/thermal limits, cache info, NUMA affinity, RAS features, and more</li>
+                    <li><strong>GPU P2P Bandwidth Testing</strong> - Measure GPU-to-GPU peer-to-peer communication speeds with dedicated HIP benchmark</li>
+                    <li><strong>Enhanced Network Tab</strong> - Detailed NIC information including driver versions, firmware, link speeds, duplex mode, PCI addresses, and traffic statistics</li>
+                    <li><strong>BMC Tab</strong> - Baseboard Management Controller information including sensors, FRU data, system event logs, and chassis status via IPMI</li>
+                </ul>
+            </div>
+
+            <h2>Features</h2>
+            <div class="feature-grid">
+                <div class="feature-card">
+                    <h4>CPU Information</h4>
+                    <p>Comprehensive CPU details including cores, threads, frequency, cache, and manufacturer information.</p>
+                </div>
+                <div class="feature-card">
+                    <h4>Enhanced GPU Details <span class="new-badge">ENHANCED</span></h4>
+                    <p>Comprehensive AMD GPU data via amd-smi: ASIC details, PCIe info, VBIOS, VRAM, cache, power/thermal limits, NUMA, RAS, firmware versions, and driver info.</p>
+                </div>
+                <div class="feature-card">
+                    <h4>Enhanced Network Interfaces <span class="new-badge">ENHANCED</span></h4>
+                    <p>Detailed NIC information: interface state, MAC/IP addresses, link speed, duplex mode, driver/firmware versions, PCI addresses, and RX/TX statistics.</p>
+                </div>
+                <div class="feature-card">
+                    <h4>BMC Information <span class="new-badge">NEW</span></h4>
+                    <p>Baseboard Management Controller data via IPMI: device info, network config, temperature/voltage/fan/power sensors, FRU data, SEL logs, and chassis status.</p>
+                </div>
+                <div class="feature-card">
+                    <h4>ROCm Runtime</h4>
+                    <p>ROCm version, HIP compiler, kernel modules, environment variables, and installed packages.</p>
+                </div>
+                <div class="feature-card">
+                    <h4>GPU Microbenchmarks <span class="new-badge">ENHANCED</span></h4>
+                    <p>Peak performance calculations, GPU-to-GPU P2P bandwidth, and real-world kernel benchmarks (GEMM, convolution, memory bandwidth, vector ops).</p>
+                </div>
+                <div class="feature-card">
+                    <h4>Tool Availability Check <span class="new-badge">NEW</span></h4>
+                    <p>Automatic detection of all required and optional tools at startup with clear reporting of missing tools and their impact on report sections.</p>
+                </div>
+                <div class="feature-card">
+                    <h4>Side-by-Side Comparison</h4>
+                    <p>Compare two servers with interactive tabbed interface and visual differences highlighting.</p>
+                </div>
+            </div>
+
+            <h2>Requirements</h2>
+            <ul>
+                <li>Python 3.6 or higher</li>
+                <li>Linux operating system (primary support for AMD GPU features)</li>
+                <li>ROCm installation (for AMD GPU details and microbenchmarks)</li>
+                <li><code>amd-smi</code> tool (for comprehensive GPU information)</li>
+                <li><code>ipmitool</code> (optional, for BMC information)</li>
+                <li><code>ethtool</code> (optional, for enhanced network details on Linux)</li>
+                <li><code>hipcc</code> compiler (optional, for GPU P2P bandwidth testing)</li>
+                <li>Administrative privileges may be required for some hardware queries</li>
+            </ul>
+
+            <div class="warning-box">
+                <strong>Note:</strong> While the tool supports Windows and macOS for basic CPU/GPU information,
+                advanced AMD GPU features, ROCm details, BMC information, and GPU P2P testing are only available on Linux systems.
+            </div>
+
+            <h2>Installation</h2>
+            <p>No installation required. Simply ensure Python 3 is installed and the scripts have execute permissions:</p>
+            <div class="code-block">
+<span class="comment"># Make scripts executable</span>
+chmod +x rapido-collect.py rapido-report.py
+
+<span class="comment"># Verify Python version</span>
+python3 --version
+
+<span class="comment"># Install optional tools for enhanced features</span>
+<span class="comment"># For BMC information (IPMI)</span>
+sudo apt-get install ipmitool        <span class="comment"># Debian/Ubuntu</span>
+sudo yum install ipmitool            <span class="comment"># RHEL/CentOS</span>
+
+<span class="comment"># For enhanced network details</span>
+sudo apt-get install ethtool         <span class="comment"># Debian/Ubuntu</span>
+sudo yum install ethtool             <span class="comment"># RHEL/CentOS</span>
+
+<span class="comment"># For GPU benchmarks (requires ROCm and hipcc)</span>
+<span class="comment"># Compile the P2P bandwidth benchmark</span>
+hipcc -o gpu_p2p_bandwidth gpu_p2p_bandwidth.cpp
+
+<span class="comment"># Compile the kernel benchmarks</span>
+hipcc -O3 -o gpu_kernel_benchmarks gpu_kernel_benchmarks.cpp
+            </div>
+
+            <h2>Usage</h2>
+
+            <h3>1. Collecting Hardware Information</h3>
+            <p>Run <code>rapido-collect.py</code> on each server you want to profile:</p>
+
+            <h4>Basic Collection</h4>
+            <div class="code-block">
+<span class="comment"># Collect all hardware information (default)</span>
+<span class="command">python3</span> rapido-collect.py
+
+<span class="comment"># Explicit all sections collection</span>
+<span class="command">python3</span> rapido-collect.py -a
+
+<span class="comment"># Output will be saved as: serverinfo_&lt;hostname&gt;.json</span>
+<span class="comment"># Example: serverinfo_gpu-server-01.json</span>
+            </div>
+
+            <h4>Selective Collection <span class="new-badge">NEW</span></h4>
+            <div class="code-block">
+<span class="comment"># Collect specific sections only (faster)</span>
+<span class="command">python3</span> rapido-collect.py -c           <span class="comment"># CPU only</span>
+<span class="command">python3</span> rapido-collect.py -g           <span class="comment"># GPU only</span>
+<span class="command">python3</span> rapido-collect.py -n           <span class="comment"># Network only</span>
+<span class="command">python3</span> rapido-collect.py -b           <span class="comment"># BMC only (may require sudo)</span>
+<span class="command">python3</span> rapido-collect.py -r           <span class="comment"># ROCm only</span>
+<span class="command">python3</span> rapido-collect.py -m           <span class="comment"># Microbenchmarks only (includes ROCm)</span>
+
+<span class="comment"># Combine multiple sections</span>
+<span class="command">python3</span> rapido-collect.py -c -g        <span class="comment"># CPU and GPU only</span>
+<span class="command">python3</span> rapido-collect.py -c -g -n     <span class="comment"># CPU, GPU, and Network only</span>
+<span class="command">python3</span> rapido-collect.py -g -r        <span class="comment"># GPU and ROCm only</span>
+            </div>
+
+            <h4>With GPU Microbenchmarks</h4>
+            <div class="code-block">
+<span class="comment"># Include GPU peak performance calculations and kernel benchmarks</span>
+<span class="command">python3</span> rapido-collect.py -m
+
+<span class="comment"># Include microbenchmarks + GPU P2P bandwidth testing</span>
+<span class="command">python3</span> rapido-collect.py -m -p
+            </div>
+
+            <h4>Verbose Mode <span class="new-badge">NEW</span></h4>
+            <div class="code-block">
+<span class="comment"># Show tool availability check and detailed progress</span>
+<span class="command">python3</span> rapido-collect.py -v
+
+<span class="comment"># Combine with other flags</span>
+<span class="command">python3</span> rapido-collect.py -c -g -v     <span class="comment"># Verbose CPU and GPU collection</span>
+<span class="command">sudo python3</span> rapido-collect.py -a -p -v  <span class="comment"># Full verbose collection</span>
+            </div>
+
+            <h4>With BMC Information</h4>
+            <div class="code-block">
+<span class="comment"># Collect BMC data (may require sudo for IPMI access)</span>
+<span class="command">sudo python3</span> rapido-collect.py
+
+<span class="comment"># Or collect only BMC data</span>
+<span class="command">sudo python3</span> rapido-collect.py -b
+            </div>
+
+            <div class="success-box">
+                <strong>Output:</strong> The script automatically generates a JSON file named
+                <code>serverinfo_&lt;hostname&gt;.json</code> containing all collected hardware information.
+            </div>
+
+            <h3>2. Tool Availability Check <span class="new-badge">NEW</span></h3>
+            <p>When <code>rapido-collect.py</code> runs, it automatically checks for all required and optional tools and reports:</p>
+            <ul>
+                <li>Which tools are available/missing (✓/✗ indicators)</li>
+                <li>Impact on each report section if tools are missing</li>
+                <li>Special checks for ROCm installation and benchmark source files</li>
+                <li>Summary of affected functionality</li>
+            </ul>
+            <div class="success-box">
+                <strong>Example Output:</strong> The tool will display a comprehensive availability report showing CPU, GPU, Network, BMC, ROCm, and Microbenchmark tools status before starting data collection.
+            </div>
+
+            <h3>3. Generating Comparison Reports</h3>
+            <p>Use <code>rapido-report.py</code> to generate HTML comparison reports:</p>
+
+            <h4>Compare Two Servers</h4>
+            <div class="code-block">
+<span class="comment"># Compare two servers side-by-side</span>
+<span class="command">python3</span> rapido-report.py \
+    -f1 serverinfo_server1.json \
+    -f2 serverinfo_server2.json \
+    -o comparison_report.html
+            </div>
+
+            <h4>Single Server Report</h4>
+            <div class="code-block">
+<span class="comment"># Generate report for a single server</span>
+<span class="command">python3</span> rapido-report.py \
+    -f1 serverinfo_server1.json \
+    -o server1_report.html
+            </div>
+
+            <h4>Legacy Mode (Single File)</h4>
+            <div class="code-block">
+<span class="comment"># Using legacy -i flag</span>
+<span class="command">python3</span> rapido-report.py \
+    -i serverinfo_server1.json \
+    -o report.html
+            </div>
+
+            <h2>Command-Line Options</h2>
+
+            <h3>rapido-collect.py</h3>
+            <table>
+                <thead>
+                    <tr>
+                        <th>Option</th>
+                        <th>Description</th>
+                    </tr>
+                </thead>
+                <tbody>
+                    <tr>
+                        <td>No arguments</td>
+                        <td>Collects all hardware information (CPU, GPU, Network, BMC, ROCm) - same as -a</td>
+                    </tr>
+                    <tr>
+                        <td>-a, --all</td>
+                        <td>Collect all sections (CPU, GPU, Network, BMC, ROCm)</td>
+                    </tr>
+                    <tr>
+                        <td>-c, --cpu</td>
+                        <td>Collect CPU information only</td>
+                    </tr>
+                    <tr>
+                        <td>-g, --gpu</td>
+                        <td>Collect GPU information only</td>
+                    </tr>
+                    <tr>
+                        <td>-n, --network</td>
+                        <td>Collect Network information only</td>
+                    </tr>
+                    <tr>
+                        <td>-b, --bmc</td>
+                        <td>Collect BMC information only (may require sudo)</td>
+                    </tr>
+                    <tr>
+                        <td>-r, --rocm</td>
+                        <td>Collect ROCm information only</td>
+                    </tr>
+                    <tr>
+                        <td>-m, --microbenchmarks</td>
+                        <td>Collect microbenchmarks only (GPU peak performance and kernel benchmarks, automatically includes ROCm)</td>
+                    </tr>
+                    <tr>
+                        <td>-p, --p2p</td>
+                        <td>Include GPU-to-GPU P2P bandwidth tests (requires -m flag)</td>
+                    </tr>
+                    <tr>
+                        <td>-v, --verbose</td>
+                        <td>Show tool availability check and detailed progress messages</td>
+                    </tr>
+                </tbody>
+            </table>
+
+            <div class="info-box">
+                <strong>Note:</strong> Selective collection flags (-c, -g, -n, -b, -r, -m) can be combined. When any specific flag is used, only those sections are collected. The report will only show tabs for sections with data.
+            </div>
+
+            <div class="info-box">
+                <strong>Note:</strong> The <code>-p</code> flag requires the <code>-m</code> flag to be effective.
+                Use <code>python3 rapido-collect.py -m -p</code> to enable both microbenchmarks and P2P testing.
+            </div>
+
+            <h3>rapido-report.py</h3>
+            <table>
+                <thead>
+                    <tr>
+                        <th>Option</th>
+                        <th>Description</th>
+                        <th>Default</th>
+                    </tr>
+                </thead>
+                <tbody>
+                    <tr>
+                        <td>-f1, --file1</td>
+                        <td>Path to the first JSON file for comparison</td>
+                        <td>None</td>
+                    </tr>
+                    <tr>
+                        <td>-f2, --file2</td>
+                        <td>Path to the second JSON file for comparison</td>
+                        <td>None</td>
+                    </tr>
+                    <tr>
+                        <td>-i, --input</td>
+                        <td>Path to a single JSON input file (legacy mode)</td>
+                        <td>None</td>
+                    </tr>
+                    <tr>
+                        <td>-o, --output</td>
+                        <td>Path for the generated HTML report file</td>
+                        <td>comparison.html</td>
+                    </tr>
+                </tbody>
+            </table>
+
+            <h2>Output Description</h2>
+
+            <h3>JSON Output (rapido-collect.py)</h3>
+            <p>The JSON file contains structured hardware information organized into sections:</p>
+            <ul>
+                <li><strong>_metadata</strong> - Collection metadata (date, status, errors) <span class="new-badge">NEW</span></li>
+                <li><strong>cpu</strong> - CPU information (manufacturer, cores, threads, frequency, cache)</li>
+                <li><strong>gpu</strong> - GPU details (name, VRAM, compute units, drivers, architecture, ASIC info, PCIe, VBIOS, power/thermal limits, cache, NUMA, RAS, firmware)</li>
+                <li><strong>network</strong> - Network interfaces (name, state, MAC/IP addresses, speed, duplex, driver/firmware, PCI address, RX/TX stats)</li>
+                <li><strong>bmc</strong> - BMC information (device info, network config, sensors, FRU data, system events, chassis status)</li>
+                <li><strong>rocm</strong> - ROCm runtime details (version, packages, environment, modules)</li>
+                <li><strong>microbenchmarks</strong> - GPU peak performance, kernel benchmarks, and P2P bandwidth measurements</li>
+            </ul>
+
+            <div class="info-box">
+                <strong>Metadata Tracking:</strong> Each JSON file now includes a <code>_metadata</code> section with collection timestamp, status (complete/partial), and any errors encountered during collection.
+            </div>
+
+            <h3>HTML Report (rapido-report.py)</h3>
+            <p>The HTML report features an interactive tabbed interface with:</p>
+            <ul>
+                <li><strong>CPU Tab</strong> - CPU specifications and capabilities</li>
+                <li><strong>GPU Tab</strong> - Comprehensive AMD GPU information via amd-smi including:
+                    <ul>
+                        <li>ASIC details (name, architecture, device/vendor IDs, compute units, serial number)</li>
+                        <li>Driver information</li>
+                        <li>PCIe bus information (BDF, link speed, generation, width)</li>
+                        <li>VBIOS information (version, part number, build date)</li>
+                        <li>Board information (model, manufacturer, serial)</li>
+                        <li>VRAM details (size, type, vendor, bandwidth, bit width)</li>
+                        <li>Cache information (L1/L2/L3 sizes and instances)</li>
+                        <li>Power and thermal limits (max/min power, temperature thresholds)</li>
+                        <li>NUMA node and CPU affinity</li>
+                        <li>Partition information (SR-IOV)</li>
+                        <li>Firmware versions</li>
+                        <li>RAS features (ECC schemas, enabled/disabled blocks)</li>
+                    </ul>
+                </li>
+                <li><strong>Network Tab</strong> - Detailed network interface information including:
+                    <ul>
+                        <li>Interface name, state, and link detection</li>
+                        <li>MAC address and IPv4/IPv6 addresses</li>
+                        <li>Link speed, duplex mode, MTU</li>
+                        <li>Driver name, version, and firmware</li>
+                        <li>PCI address</li>
+                        <li>RX/TX bytes and packets (with human-readable formatting)</li>
+                        <li>Error statistics</li>
+                    </ul>
+                </li>
+                <li><strong>BMC Tab</strong> - Baseboard Management Controller information including:
+                    <ul>
+                        <li>BMC device information (firmware version, device ID, manufacturer)</li>
+                        <li>Network configuration (IP, MAC, subnet, gateway)</li>
+                        <li>Temperature sensors</li>
+                        <li>Voltage sensors</li>
+                        <li>Fan sensors</li>
+                        <li>Power sensors</li>
+                        <li>FRU (Field Replaceable Unit) data</li>
+                        <li>System Event Log (SEL) information and recent events</li>
+                        <li>Chassis power and status information</li>
+                    </ul>
+                </li>
+                <li><strong>ROCm Tab</strong> - ROCm runtime environment and installation details</li>
+                <li><strong>Microbenchmarks Tab</strong> - GPU peak performance, kernel benchmarks, and P2P bandwidth:
+                    <ul>
+                        <li>Peak FP32, FP64, FP16, INT8 performance calculations</li>
+                        <li><strong>Kernel Benchmarks (NEW):</strong> GEMM FP32/FP64, memory bandwidth, vector operations, FMA throughput, 1D convolution</li>
+                        <li>GPU-to-GPU P2P bandwidth measurements (all pairs)</li>
+                        <li>P2P capability detection</li>
+                    </ul>
+                </li>
+            </ul>
+
+            <div class="info-box">
+                <strong>Comparison Mode:</strong> When comparing two files, each tab displays data side-by-side
+                for easy visual comparison between systems. The report title will show "AMD Rapido Server Information Comparison".
+                For single-device reports, the title is "AMD Rapido Server Information".
+            </div>
+
+            <div class="success-box">
+                <strong>Dynamic Tab Visibility:</strong> Tabs only appear when data is available for that section.
+                For example, if you collected only CPU and GPU data using <code>-c -g</code> flags, only CPU and GPU tabs will be shown in the report.
+            </div>
+
+            <h2>GPU P2P Bandwidth Testing <span class="new-badge">NEW</span></h2>
+            <p>The GPU peer-to-peer bandwidth benchmark measures direct GPU-to-GPU communication speeds:</p>
+
+            <h3>How It Works</h3>
+            <ul>
+                <li>Tests all GPU pairs in the system (bidirectional)</li>
+                <li>Uses 256 MB transfers over 10 iterations for accurate measurements</li>
+                <li>Checks P2P capability between each GPU pair</li>
+                <li>Reports bandwidth in GB/s for each connection</li>
+            </ul>
+
+            <h3>Compiling the Benchmark</h3>
+            <div class="code-block">
+<span class="comment"># Compile with hipcc (requires ROCm installation)</span>
+<span class="command">hipcc</span> -o gpu_p2p_bandwidth gpu_p2p_bandwidth.cpp
+
+<span class="comment"># The compiled binary is automatically used by rapido-collect.py</span>
+<span class="command">python3</span> rapido-collect.py -m -p
+            </div>
+
+            <h3>Output Example</h3>
+            <p>P2P bandwidth results appear in the Microbenchmarks tab showing:</p>
+            <ul>
+                <li>Source GPU and destination GPU</li>
+                <li>GPU architecture names</li>
+                <li>P2P enabled/disabled status</li>
+                <li>Bandwidth in GB/s</li>
+            </ul>
+
+            <h2>BMC Information Collection <span class="new-badge">NEW</span></h2>
+            <p>The BMC tab provides comprehensive baseboard management controller information via IPMI:</p>
+
+            <h3>Prerequisites</h3>
+            <div class="code-block">
+<span class="comment"># Install ipmitool</span>
+sudo apt-get install ipmitool        <span class="comment"># Debian/Ubuntu</span>
+sudo yum install ipmitool            <span class="comment"># RHEL/CentOS</span>
+
+<span class="comment"># BMC collection may require sudo privileges</span>
+<span class="command">sudo python3</span> rapido-collect.py
+            </div>
+
+            <h3>Collected Information</h3>
+            <table>
+                <thead>
+                    <tr>
+                        <th>Category</th>
+                        <th>Information</th>
+                    </tr>
+                </thead>
+                <tbody>
+                    <tr>
+                        <td>Device Info</td>
+                        <td>Firmware version, device ID, manufacturer, IPMI version</td>
+                    </tr>
+                    <tr>
+                        <td>Network Config</td>
+                        <td>IP address, MAC address, subnet mask, gateway, VLAN settings</td>
+                    </tr>
+                    <tr>
+                        <td>Sensors</td>
+                        <td>Temperature, voltage, fan speed, power consumption readings</td>
+                    </tr>
+                    <tr>
+                        <td>FRU Data</td>
+                        <td>Board info, product info, chassis info, serial numbers, part numbers</td>
+                    </tr>
+                    <tr>
+                        <td>System Events</td>
+                        <td>SEL information, recent events with timestamps</td>
+                    </tr>
+                    <tr>
+                        <td>Chassis</td>
+                        <td>Power status, chassis status, control capabilities</td>
+                    </tr>
+                </tbody>
+            </table>
+
+            <h2>Examples</h2>
+
+            <h3>Example 1: Complete System Profile with All Features</h3>
+            <div class="code-block">
+<span class="comment"># Collect comprehensive hardware info including microbenchmarks, P2P, and BMC</span>
+<span class="command">sudo python3</span> rapido-collect.py -m -p
+<span class="comment"># Creates: serverinfo_gpu-server-01.json with all data</span>
+
+<span class="comment"># Generate HTML report</span>
+<span class="command">python3</span> rapido-report.py -f1 serverinfo_gpu-server-01.json -o complete_report.html
+
+<span class="comment"># View report in browser</span>
+<span class="command">firefox</span> complete_report.html
+            </div>
+
+            <h3>Example 2: Compare Two GPU Servers</h3>
+            <div class="code-block">
+<span class="comment"># Collect from Server 1 with GPU P2P testing</span>
+<span class="command">ssh</span> user@gpu-server-01
+<span class="command">sudo python3</span> rapido-collect.py -m -p
+<span class="command">scp</span> serverinfo_gpu-server-01.json user@workstation:/tmp/
+
+<span class="comment"># Collect from Server 2 with GPU P2P testing</span>
+<span class="command">ssh</span> user@gpu-server-02
+<span class="command">sudo python3</span> rapido-collect.py -m -p
+<span class="command">scp</span> serverinfo_gpu-server-02.json user@workstation:/tmp/
+
+<span class="comment"># Generate comparison report on workstation</span>
+<span class="command">cd</span> /tmp
+<span class="command">python3</span> rapido-report.py \
+    -f1 serverinfo_gpu-server-01.json \
+    -f2 serverinfo_gpu-server-02.json \
+    -o gpu_servers_comparison.html
+
+<span class="comment"># Open comparison report</span>
+<span class="command">firefox</span> gpu_servers_comparison.html
+            </div>
+
+            <h3>Example 3: Quick Network Comparison</h3>
+            <div class="code-block">
+<span class="comment"># Collect basic info (includes enhanced network details)</span>
+<span class="command">python3</span> rapido-collect.py
+
+<span class="comment"># Generate report focusing on network tab</span>
+<span class="command">python3</span> rapido-report.py -f1 serverinfo_*.json -o network_report.html
+<span class="comment"># Open the Network tab to see detailed NIC information</span>
+            </div>
+
+            <h3>Example 4: Automated Batch Collection with Full Features</h3>
+            <div class="code-block">
+<span class="comment">#!/bin/bash</span>
+<span class="comment"># Script to collect comprehensive data from multiple servers</span>
+
+SERVERS="gpu-01 gpu-02 gpu-03 gpu-04"
+
+for server in $SERVERS; do
+    echo "Collecting from $server..."
+    <span class="command">ssh</span> user@$server "cd /opt/rapido && sudo python3 rapido-collect.py -m -p"
+    <span class="command">scp</span> user@$server:/opt/rapido/serverinfo_*.json ./collected/
+done
+
+<span class="comment"># Generate comparison reports</span>
+<span class="command">python3</span> rapido-report.py \
+    -f1 collected/serverinfo_gpu-01.json \
+    -f2 collected/serverinfo_gpu-02.json \
+    -o comparison_01_vs_02.html
+
+<span class="command">python3</span> rapido-report.py \
+    -f1 collected/serverinfo_gpu-03.json \
+    -f2 collected/serverinfo_gpu-04.json \
+    -o comparison_03_vs_04.html
+            </div>
+
+            <h2>Troubleshooting</h2>
+
+            <h3>Common Issues</h3>
+
+            <div class="warning-box">
+                <strong>Issue:</strong> No AMD GPU information collected<br>
+                <strong>Solution:</strong> Ensure ROCm is installed and <code>amd-smi</code> is accessible.
+                Check if <code>amd-smi list</code> works. Fallback to <code>rocm-smi</code> if available.
+            </div>
+
+            <div class="warning-box">
+                <strong>Issue:</strong> BMC tab not appearing in report<br>
+                <strong>Solution:</strong> Install <code>ipmitool</code> and run collection with <code>sudo</code>.
+                Verify IPMI is accessible: <code>sudo ipmitool bmc info</code>
+            </div>
+
+            <div class="warning-box">
+                <strong>Issue:</strong> GPU P2P bandwidth shows 0.00 GB/s<br>
+                <strong>Solution:</strong> Compile the HIP benchmark (<code>hipcc -o gpu_p2p_bandwidth gpu_p2p_bandwidth.cpp</code>).
+                Ensure P2P is supported between GPUs. Check PCIe topology.
+            </div>
+
+            <div class="warning-box">
+                <strong>Issue:</strong> Permission denied errors<br>
+                <strong>Solution:</strong> Some hardware queries require elevated privileges. Try running with
+                <code>sudo python3 rapido-collect.py</code>
+            </div>
+
+            <div class="warning-box">
+                <strong>Issue:</strong> Missing network driver/firmware information<br>
+                <strong>Solution:</strong> Install <code>ethtool</code> for enhanced network details:
+                <code>sudo apt-get install ethtool</code> (Debian/Ubuntu) or <code>sudo yum install ethtool</code> (RHEL/CentOS)
+            </div>
+
+            <div class="warning-box">
+                <strong>Issue:</strong> GPU data parsing errors<br>
+                <strong>Solution:</strong> Ensure <code>amd-smi</code> is up to date. The tool supports both old and new amd-smi JSON formats.
+                Check that <code>amd-smi static --json</code> works manually.
+            </div>
+
+            <div class="warning-box">
+                <strong>Issue:</strong> JSON file corrupted or incomplete<br>
+                <strong>Solution:</strong> This usually means data collection was interrupted (Ctrl+C, crash, or system shutdown).
+                Re-run data collection: <code>python3 rapido-collect.py</code>. The tool now includes crash protection and will save partial data if interrupted.
+            </div>
+
+            <div class="warning-box">
+                <strong>Issue:</strong> Empty tabs appearing in report<br>
+                <strong>Solution:</strong> Use selective collection flags to only collect needed sections.
+                Example: <code>python3 rapido-collect.py -c -g</code> for CPU and GPU only.
+            </div>
+
+            <h2>Best Practices</h2>
+            <ul>
+                <li>Run collection during system idle time for accurate baseline measurements</li>
+                <li>Use <code>sudo</code> for complete hardware access (especially for BMC and some GPU features)</li>
+                <li>Compile GPU P2P benchmark before running collection with <code>-p</code> flag</li>
+                <li>Keep JSON files organized with clear naming conventions (hostname, date, etc.)</li>
+                <li>Archive JSON files for historical comparison and tracking hardware changes</li>
+                <li>Use descriptive output filenames when generating comparison reports</li>
+                <li>Verify ROCm, GPU drivers, and amd-smi are up to date before collection</li>
+                <li>Install optional tools (<code>ipmitool</code>, <code>ethtool</code>) for comprehensive data</li>
+                <li>For multi-GPU systems, always use <code>-m -p</code> flags to capture P2P performance</li>
+            </ul>
+
+            <h2>Performance Considerations</h2>
+            <ul>
+                <li><strong>Basic collection</strong> (~5-10 seconds) - CPU, GPU, Network, BMC, ROCm info</li>
+                <li><strong>Selective collection</strong> (~1-5 seconds) - Only specific sections (e.g., <code>-c -g</code>)</li>
+                <li><strong>With microbenchmarks (-m)</strong> (~20-40 seconds) - Adds peak performance calculations and kernel benchmarks</li>
+                <li><strong>With P2P testing (-m -p)</strong> (~30-120 seconds) - Depends on number of GPUs (N² tests for N GPUs)</li>
+                <li><strong>BMC collection</strong> (~10-30 seconds) - Depends on IPMI responsiveness</li>
+            </ul>
+
+            <div class="info-box">
+                <strong>Tip:</strong> Use selective collection flags (<code>-c</code>, <code>-g</code>, <code>-n</code>, etc.) to significantly reduce collection time when you only need specific hardware information.
+            </div>
+
+            <h2>System Compatibility</h2>
+
+            <div class="info-box">
+                <strong>Supported Platforms:</strong>
+                <ul>
+                    <li><strong>Linux</strong> (Full support - recommended)
+                        <ul>
+                            <li>All features available</li>
+                            <li>Tested on Ubuntu, RHEL, CentOS, SLES</li>
+                            <li>Requires ROCm for AMD GPU features</li>
+                        </ul>
+                    </li>
+                    <li><strong>Windows</strong> (Basic CPU/GPU/Network support)
+                        <ul>
+                            <li>CPU and basic GPU information</li>
+                            <li>Enhanced network adapter details via PowerShell</li>
+                            <li>No ROCm, BMC, or P2P testing support</li>
+                        </ul>
+                    </li>
+                    <li><strong>macOS</strong> (Basic CPU/GPU/Network support)
+                        <ul>
+                            <li>CPU and basic GPU information</li>
+                            <li>Network interface details via ifconfig/netstat</li>
+                            <li>No ROCm, BMC, or P2P testing support</li>
+                        </ul>
+                    </li>
+                </ul>
+            </div>
+
+            <h2>Supported AMD GPU Architectures</h2>
+            <table>
+                <thead>
+                    <tr>
+                        <th>Architecture</th>
+                        <th>Examples</th>
+                        <th>Features</th>
+                    </tr>
+                </thead>
+                <tbody>
+                    <tr>
+                        <td>CDNA3</td>
+                        <td>MI300X, MI300A, MI355X</td>
+                        <td>Full support, FP8/FP4, comprehensive amd-smi data, P2P</td>
+                    </tr>
+                    <tr>
+                        <td>CDNA2</td>
+                        <td>MI250X, MI250, MI210</td>
+                        <td>Full support, BF16, comprehensive data, P2P</td>
+                    </tr>
+                    <tr>
+                        <td>CDNA</td>
+                        <td>MI100</td>
+                        <td>Full support, comprehensive data, P2P</td>
+                    </tr>
+                    <tr>
+                        <td>RDNA3</td>
+                        <td>RX 7900 XTX, RX 7900 XT</td>
+                        <td>Basic GPU info, limited ROCm features</td>
+                    </tr>
+                    <tr>
+                        <td>RDNA2</td>
+                        <td>RX 6900 XT, RX 6800 XT</td>
+                        <td>Basic GPU info, limited ROCm features</td>
+                    </tr>
+                </tbody>
+            </table>
+
+            <h2>Support & Contributions</h2>
+            <p>
+                AMD Rapido is designed to provide comprehensive hardware profiling for AMD GPU-equipped systems.
+                For issues, feature requests, or contributions, please contact your system administrator or
+                AMD support team.
+            </p>
+
+            <h2>Version History</h2>
+            <div class="info-box">
+                <strong>Version 2.2</strong> (Current)
+                <ul>
+                    <li>Selective data collection with flags: -c (CPU), -g (GPU), -n (Network), -b (BMC), -r (ROCm), -m (Microbenchmarks)</li>
+                    <li>Dynamic tab visibility - tabs only appear when data is available</li>
+                    <li>Conditional report titles - "Comparison" only shows when comparing two devices</li>
+                    <li>Enhanced error handling with JSON validation and crash protection</li>
+                    <li>Metadata tracking (_metadata section) with collection status and error logging</li>
+                    <li>Support for both old and new amd-smi JSON formats</li>
+                    <li>Verbose mode (-v) for detailed progress and tool availability reporting</li>
+                    <li>Partial data saving on interruption (Ctrl+C)</li>
+                </ul>
+            </div>
+
+            <div class="info-box">
+                <strong>Version 2.1</strong>
+                <ul>
+                    <li>Tool availability check at startup with impact reporting</li>
+                    <li>GPU kernel benchmarks (GEMM FP32/FP64, memory bandwidth, vector ops, FMA, convolution)</li>
+                    <li>Renamed rapido-compare.py to rapido-report.py</li>
+                    <li>Enhanced microbenchmarks tab with real-world performance testing</li>
+                </ul>
+            </div>
+
+            <div class="info-box">
+                <strong>Version 2.0</strong>
+                <ul>
+                    <li>Enhanced GPU tab with comprehensive amd-smi data collection</li>
+                    <li>GPU-to-GPU P2P bandwidth measurement</li>
+                    <li>Enhanced network tab with detailed NIC information</li>
+                    <li>New BMC tab with IPMI-based management controller data</li>
+                    <li>Improved error handling and data parsing</li>
+                    <li>Support for value/unit structures in JSON output</li>
+                </ul>
+            </div>
+
+            <div class="info-box">
+                <strong>Version 1.0</strong>
+                <ul>
+                    <li>Initial release</li>
+                    <li>Basic CPU, GPU, Network, ROCm collection</li>
+                    <li>Side-by-side comparison reports</li>
+                    <li>GPU data format support listing</li>
+                </ul>
+            </div>
+        </div>
+
+        <div class="footer">
+            <p><strong>AMD Rapido</strong> - Server Hardware Information Collection & Comparison Tool</p>
+            <p>Designed for AMD GPU-equipped HPC and AI/ML systems</p>
+            <p style="margin-top: 15px; font-size: 0.9rem;">
+                &copy; 2024-2025 AMD. For internal use and system profiling.
+            </p>
+        </div>
+    </div>
+</body>
+</html>

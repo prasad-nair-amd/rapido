@@ -1,9 +1,11 @@
 ﻿#!/usr/bin/env python3
+import argparse
 import json
 import os
 import platform
 import socket
 import subprocess
+import sys
 from collections import OrderedDict
 from typing import Dict, List, Optional
 
@@ -19,6 +21,182 @@ def run_command(cmd: list[str]) -> Optional[str]:
         return result.stdout.strip()
     except (subprocess.SubprocessError, FileNotFoundError):
         return None
+
+def check_tool_availability(verbose: bool = True) -> None:
+    """Check and report availability of all required and optional tools."""
+    system = platform.system().lower()
+    
+    if verbose:
+        print("=" * 80)
+        print("AMD Rapido - Tool Availability Check")
+        print("=" * 80)
+        print(f"Operating System: {platform.system()} {platform.release()}")
+        print(f"Python Version: {platform.python_version()}")
+        print()
+    
+    # Define tools and their impact
+    tools_info = {
+        "linux": {
+            "required": [
+                ("python3", "Python 3", "All functionality will fail"),
+            ],
+            "cpu": [
+                ("lscpu", "CPU Information", "Will fallback to /proc/cpuinfo"),
+            ],
+            "gpu": [
+                ("amd-smi", "GPU Information", "GPU details will be incomplete or missing"),
+                ("rocminfo", "ROCm GPU Details", "GPU architecture details will be missing"),
+            ],
+            "network": [
+                ("ip", "Network Interfaces", "Network information will be incomplete"),
+                ("ethtool", "Network Details", "Driver, speed, and firmware info will be missing"),
+            ],
+            "bmc": [
+                ("ipmitool", "BMC Information", "BMC section will be empty"),
+            ],
+            "rocm": [
+                ("hipcc", "HIP Compiler", "ROCm version info will be incomplete"),
+                ("rocm-smi", "ROCm SMI", "ROCm monitoring info will be missing"),
+                ("clinfo", "OpenCL Info", "OpenCL details will be missing"),
+                ("dpkg", "Package Info (Debian)", "Installed packages list will be incomplete"),
+                ("rpm", "Package Info (RHEL)", "Installed packages list will be incomplete"),
+            ],
+            "microbenchmarks": [
+                ("hipcc", "HIP Compiler", "Kernel benchmarks and P2P tests will be skipped"),
+            ],
+        },
+        "windows": {
+            "required": [
+                ("python", "Python", "All functionality will fail"),
+            ],
+            "cpu": [
+                ("wmic", "CPU Information", "Will fallback to PowerShell"),
+                ("powershell", "PowerShell", "CPU information will be limited"),
+            ],
+            "gpu": [
+                ("wmic", "GPU Information", "Will fallback to PowerShell"),
+                ("powershell", "PowerShell", "GPU information will be limited"),
+            ],
+            "network": [
+                ("powershell", "PowerShell", "Network information will be missing"),
+            ],
+        },
+        "darwin": {
+            "required": [
+                ("python3", "Python 3", "All functionality will fail"),
+            ],
+            "cpu": [
+                ("sysctl", "System Info", "CPU information will be missing"),
+            ],
+            "gpu": [
+                ("system_profiler", "System Profiler", "GPU information will be missing"),
+            ],
+            "network": [
+                ("ifconfig", "Network Config", "Network information will be missing"),
+                ("netstat", "Network Stats", "Network statistics will be missing"),
+            ],
+        },
+    }
+    
+    # Get tools for current OS
+    os_tools = tools_info.get(system, tools_info.get("linux", {}))
+    
+    available_tools = []
+    missing_tools = []
+    
+    # Check each category
+    for category, tools in os_tools.items():
+        if not tools:
+            continue
+            
+        if verbose:
+            print(f"\n{category.upper()} Tools:")
+            print("-" * 80)
+        
+        for tool_cmd, tool_name, impact in tools:
+            # Check if tool exists
+            result = run_command([tool_cmd, "--version"]) if system != "windows" else run_command([tool_cmd, "/?"])
+            
+            # Some tools don't support --version, try different approaches
+            if result is None:
+                if tool_cmd in ["ip", "ethtool", "ipmitool"]:
+                    result = run_command([tool_cmd])
+                elif tool_cmd == "system_profiler":
+                    result = run_command(["which", tool_cmd])
+                elif tool_cmd in ["dpkg", "rpm"]:
+                    result = run_command(["which", tool_cmd])
+            
+            if verbose:
+                status = "✓" if result is not None else "✗"
+                status_text = "AVAILABLE" if result is not None else "MISSING"
+                print(f"  {status} {tool_name:30} [{status_text:9}]  ({tool_cmd})")
+            
+            if result is None:
+                if verbose:
+                    print(f"    Impact: {impact}")
+                missing_tools.append((category, tool_name, impact, tool_cmd))
+            else:
+                available_tools.append((category, tool_name, tool_cmd))
+    
+    # Special checks for files
+    if system == "linux" and verbose:
+        print(f"\n{'SPECIAL CHECKS'}")
+        print("-" * 80)
+        
+        # Check for GPU benchmark source files
+        script_dir = os.path.dirname(os.path.abspath(__file__))
+        
+        p2p_cpp = os.path.join(script_dir, "gpu_p2p_bandwidth.cpp")
+        kernel_cpp = os.path.join(script_dir, "gpu_kernel_benchmarks.cpp")
+        
+        p2p_exists = os.path.exists(p2p_cpp)
+        kernel_exists = os.path.exists(kernel_cpp)
+        
+        print(f"  {'✓' if p2p_exists else '✗'} GPU P2P Benchmark Source    [{'FOUND' if p2p_exists else 'MISSING'}]")
+        if not p2p_exists:
+            print(f"    Impact: P2P bandwidth tests will be skipped (requires -p flag)")
+        
+        print(f"  {'✓' if kernel_exists else '✗'} Kernel Benchmark Source     [{'FOUND' if kernel_exists else 'MISSING'}]")
+        if not kernel_exists:
+            print(f"    Impact: Kernel benchmarks will be skipped (requires -m flag)")
+        
+        # Check ROCm installation
+        rocm_path_exists = os.path.exists("/opt/rocm")
+        print(f"  {'✓' if rocm_path_exists else '✗'} ROCm Installation         [{'FOUND' if rocm_path_exists else 'MISSING'}]")
+        if not rocm_path_exists:
+            print(f"    Impact: ROCm section and GPU benchmarks will be incomplete")
+    
+    # Summary
+    if verbose:
+        print()
+        print("=" * 80)
+        print("SUMMARY")
+        print("=" * 80)
+        print(f"Available Tools: {len(available_tools)}")
+        print(f"Missing Tools:   {len(missing_tools)}")
+        print()
+        
+        if missing_tools:
+            print("AFFECTED REPORT SECTIONS:")
+            print("-" * 80)
+            
+            # Group by category
+            category_impacts = {}
+            for category, tool_name, impact, tool_cmd in missing_tools:
+                if category not in category_impacts:
+                    category_impacts[category] = []
+                category_impacts[category].append(f"  - {tool_name} ({tool_cmd}): {impact}")
+            
+            for category, impacts in category_impacts.items():
+                print(f"\n{category.upper()}:")
+                for impact in impacts:
+                    print(impact)
+        else:
+            print("✓ All tools are available! Full functionality enabled.")
+        
+        print()
+        print("=" * 80)
+        print()
 
 def windows_cpu_info() -> Dict[str, str]:
     info = OrderedDict()
@@ -128,251 +306,434 @@ def windows_gpu_info() -> List[Dict[str, str]]:
 
 def linux_gpu_info() -> List[Dict[str, str]]:
     entries: List[Dict[str, str]] = []
-    nvidia = run_command([
-        "nvidia-smi",
-        "--query-gpu=name,memory.total,driver_version,uuid",
-        "--format=csv,noheader",
-    ])
-    if nvidia:
-        for line in nvidia.splitlines():
-            parts = [segment.strip() for segment in line.split(",")]
-            if len(parts) >= 3:
-                record = OrderedDict()
-                record["Name"] = parts[0]
-                record["Total Memory"] = parts[1]
-                record["Driver Version"] = parts[2]
-                if len(parts) > 3:
-                    record["UUID"] = parts[3]
-                entries.append(record)
 
-    # AMD GPU information - try amd-smi first (newer tool), then rocm-smi
-    amd_smi_static = run_command(["amd-smi", "static", "--json"])
-    if amd_smi_static:
+    # Get AMD GPU driver/library version first
+    version_info = OrderedDict()
+    version_info["Section"] = "AMD Driver and Library Versions"
+    amd_smi_version = run_command(["amd-smi", "version", "--json"])
+    if amd_smi_version:
         try:
-            data = json.loads(amd_smi_static)
-            if isinstance(data, dict):
-                for _, gpu_data in data.items():
-                    if isinstance(gpu_data, dict):
-                        record = OrderedDict()
-                        record["Vendor"] = "AMD"
+            version_data = json.loads(amd_smi_version)
+            if isinstance(version_data, dict):
+                for key, value in version_data.items():
+                    if value and str(value).strip():
+                        version_info[key] = str(value)
+        except json.JSONDecodeError as e:
+            pass
 
-                        # Basic identification
-                        if "asic" in gpu_data and isinstance(gpu_data["asic"], dict):
-                            asic = gpu_data["asic"]
-                            if "market_name" in asic:
-                                record["Name"] = asic["market_name"]
-                            if "vendor_name" in asic:
-                                record["Vendor Name"] = asic["vendor_name"]
-                            if "asic_serial" in asic:
-                                record["Serial Number"] = asic["asic_serial"]
+    if len(version_info) > 1:
+        entries.append(version_info)
 
-                        # VBIOS information
-                        if "vbios" in gpu_data and isinstance(gpu_data["vbios"], dict):
-                            vbios = gpu_data["vbios"]
-                            if "part_number" in vbios:
-                                record["VBIOS Part Number"] = vbios["part_number"]
-                            if "version" in vbios:
-                                record["VBIOS Version"] = vbios["version"]
-                            if "build_date" in vbios:
-                                record["VBIOS Build Date"] = vbios["build_date"]
-
-                        # Bus information
-                        if "bus" in gpu_data and isinstance(gpu_data["bus"], dict):
-                            bus = gpu_data["bus"]
-                            if "bdf" in bus:
-                                record["BDF"] = bus["bdf"]
-                            if "max_pcie_width" in bus:
-                                record["Max PCIe Width"] = f"{bus['max_pcie_width']} lanes"
-                            if "max_pcie_speed" in bus:
-                                record["Max PCIe Speed"] = bus["max_pcie_speed"]
-                            if "pcie_interface_version" in bus:
-                                record["PCIe Version"] = bus["pcie_interface_version"]
-
-                        # VRAM information
-                        if "vram" in gpu_data and isinstance(gpu_data["vram"], dict):
-                            vram = gpu_data["vram"]
-                            if "vram_size" in vram:
-                                try:
-                                    vram_mb = int(vram["vram_size"])
-                                    record["VRAM Size"] = f"{vram_mb / 1024:.2f} GB"
-                                except (ValueError, TypeError):
-                                    record["VRAM Size"] = str(vram["vram_size"])
-                            if "vram_type" in vram:
-                                record["VRAM Type"] = vram["vram_type"]
-                            if "vram_bit_width" in vram:
-                                record["VRAM Bit Width"] = f"{vram['vram_bit_width']}-bit"
-
-                        # Compute capabilities
-                        if "asic" in gpu_data and isinstance(gpu_data["asic"], dict):
-                            asic = gpu_data["asic"]
-                            if "num_compute_units" in asic:
-                                record["Compute Units"] = str(asic["num_compute_units"])
-                            if "target_graphics_version" in asic:
-                                record["GFX Version"] = asic["target_graphics_version"]
-
-                        # Cache information
-                        if "cache_info" in gpu_data and isinstance(gpu_data["cache_info"], dict):
-                            for cache_level, cache_data in gpu_data["cache_info"].items():
-                                if isinstance(cache_data, dict) and "cache_size" in cache_data:
-                                    record[f"{cache_level.upper()} Cache"] = cache_data["cache_size"]
-
-                        if record.get("Name"):
-                            entries.append(record)
+    # List all GPUs, VFs, and NICs
+    device_list_info = OrderedDict()
+    device_list_info["Section"] = "Device List (GPUs, VFs, NICs)"
+    amd_smi_list = run_command(["amd-smi", "list", "--json"])
+    if amd_smi_list:
+        try:
+            list_data = json.loads(amd_smi_list)
+            if isinstance(list_data, dict):
+                device_num = 1
+                for device_key, device_info in list_data.items():
+                    if isinstance(device_info, dict):
+                        device_str = f"Device {device_num}: "
+                        details = []
+                        if "bdf" in device_info:
+                            details.append(f"BDF={device_info['bdf']}")
+                        if "uuid" in device_info:
+                            details.append(f"UUID={device_info['uuid']}")
+                        if "device_name" in device_info:
+                            details.append(f"Name={device_info['device_name']}")
+                        device_list_info[device_str] = ", ".join(details) if details else str(device_info)
+                        device_num += 1
         except json.JSONDecodeError:
             pass
 
-    # Fallback to rocm-smi if amd-smi is not available
-    if not amd_smi_static:
-        rocm_smi_all = run_command(["rocm-smi", "--showid", "--showproductname", "--showvbios", "--showbus",
-                                     "--showmeminfo", "vram", "--showmemvendor", "--showdriverversion", "--json"])
-        if rocm_smi_all:
-            try:
-                data = json.loads(rocm_smi_all)
-                for _, gpu_info in data.items():
-                    if isinstance(gpu_info, dict):
-                        record = OrderedDict()
-                        record["Vendor"] = "AMD"
+    if len(device_list_info) > 1:
+        entries.append(device_list_info)
 
-                        # Product name
-                        if "Card series" in gpu_info:
-                            record["Name"] = gpu_info["Card series"]
-                        elif "Card model" in gpu_info:
-                            record["Name"] = gpu_info["Card model"]
+    # AMD GPU detailed information using amd-smi static
+    amd_smi_static = run_command(["amd-smi", "static", "--json"])
+    parse_error_details = None
+    
+    if amd_smi_static:
+        try:
+            data = json.loads(amd_smi_static)
 
-                        # VBIOS
-                        if "VBIOS version" in gpu_info:
-                            record["VBIOS Version"] = gpu_info["VBIOS version"]
+            # Handle both JSON formats:
+            # 1. Newer format: direct array of GPU objects
+            # 2. Older format: dict with "gpu_data" key containing array
+            gpu_list = None
+            
+            if isinstance(data, list):
+                # Newer amd-smi format: JSON is directly an array of GPUs
+                gpu_list = data
+            elif isinstance(data, dict) and "gpu_data" in data:
+                # Older amd-smi format: JSON has "gpu_data" key
+                gpu_list = data["gpu_data"]
+            elif isinstance(data, dict):
+                parse_error_details = f"amd-smi JSON missing 'gpu_data' key. Available keys: {list(data.keys())}"
+            else:
+                parse_error_details = f"amd-smi returned unexpected JSON type: {type(data).__name__}"
+            
+            if gpu_list is not None:
+                if not gpu_list:
+                    parse_error_details = "amd-smi returned empty gpu_data array (no GPUs found)"
 
-                        # GPU ID and device information
-                        if "GPU ID" in gpu_info:
-                            record["GPU ID"] = gpu_info["GPU ID"]
-                        if "Device ID" in gpu_info:
-                            record["Device ID"] = gpu_info["Device ID"]
-                        if "PCI Bus" in gpu_info:
-                            record["PCI Bus"] = gpu_info["PCI Bus"]
+                for gpu_data in gpu_list:
+                    if not isinstance(gpu_data, dict):
+                        continue
 
-                        # VRAM information
-                        if "VRAM Total Memory (B)" in gpu_info:
-                            vram_bytes = gpu_info["VRAM Total Memory (B)"]
-                            try:
-                                vram_gb = int(vram_bytes) / (1024**3)
-                                record["VRAM Size"] = f"{vram_gb:.2f} GB"
-                            except (ValueError, TypeError):
-                                record["VRAM Size"] = str(vram_bytes)
-                        if "VRAM Total Used Memory (B)" in gpu_info:
-                            used_bytes = gpu_info["VRAM Total Used Memory (B)"]
-                            try:
-                                used_gb = int(used_bytes) / (1024**3)
-                                record["VRAM Used"] = f"{used_gb:.2f} GB"
-                            except (ValueError, TypeError):
-                                record["VRAM Used"] = str(used_bytes)
-                        if "Memory vendor" in gpu_info:
-                            record["Memory Vendor"] = gpu_info["Memory vendor"]
+                    record = OrderedDict()
 
-                        # Driver version
-                        if "Driver version" in gpu_info:
-                            record["ROCm Driver Version"] = gpu_info["Driver version"]
+                    # Get GPU ID from the gpu field
+                    gpu_id = gpu_data.get("gpu", "Unknown")
 
-                        if record.get("Name"):
-                            entries.append(record)
-            except json.JSONDecodeError:
-                pass
+                    # Section header with GPU ID
+                    gpu_name = "Unknown GPU"
+                    if "asic" in gpu_data and isinstance(gpu_data["asic"], dict):
+                        if "market_name" in gpu_data["asic"]:
+                            gpu_name = gpu_data["asic"]["market_name"]
 
-    # Additional static information from rocminfo
-    rocminfo = run_command(["rocminfo"])
-    if rocminfo:
-        current_agent = OrderedDict()
-        in_gpu_agent = False
+                    record["Section"] = f"{gpu_name} (GPU {gpu_id})"
 
-        for line in rocminfo.splitlines():
-            line = line.strip()
+                    # === ASIC Details ===
+                    if "asic" in gpu_data and isinstance(gpu_data["asic"], dict):
+                        asic = gpu_data["asic"]
+                        if "market_name" in asic:
+                            record["GPU Name"] = asic["market_name"]
+                        if "vendor_name" in asic:
+                            record["Vendor"] = asic["vendor_name"]
+                        if "asic_serial" in asic:
+                            record["Serial Number"] = asic["asic_serial"]
+                        if "target_graphics_version" in asic:
+                            record["GFX Architecture"] = asic["target_graphics_version"]
+                        if "device_id" in asic:
+                            record["Device ID"] = asic["device_id"]
+                        if "vendor_id" in asic:
+                            record["Vendor ID"] = asic["vendor_id"]
+                        if "subsystem_id" in asic:
+                            record["Subsystem ID"] = asic["subsystem_id"]
+                        if "revision_id" in asic:
+                            record["Revision ID"] = asic["revision_id"]
+                        if "rev_id" in asic:
+                            record["Revision ID"] = asic["rev_id"]
+                        if "oam_id" in asic:
+                            record["OAM ID"] = str(asic["oam_id"])
+                        if "subvendor_id" in asic:
+                            record["Subvendor ID"] = asic["subvendor_id"]
+                        if "num_compute_units" in asic:
+                            record["Compute Units"] = str(asic["num_compute_units"])
+                        if "num_shader_engines" in asic:
+                            record["Shader Engines"] = str(asic["num_shader_engines"])
+                        if "num_shader_arrays_per_engine" in asic:
+                            record["Shader Arrays per Engine"] = str(asic["num_shader_arrays_per_engine"])
 
-            # Detect agent boundaries
-            if line.startswith("*******"):
-                if current_agent and current_agent.get("Name") and in_gpu_agent:
-                    # Check if we already have this GPU from amd-smi/rocm-smi
-                    gpu_exists = False
-                    for existing_gpu in entries:
-                        if existing_gpu.get("Name") == current_agent.get("Name"):
-                            # Merge additional info
-                            for key, value in current_agent.items():
-                                if key not in existing_gpu:
-                                    existing_gpu[key] = value
-                            gpu_exists = True
-                            break
-                    if not gpu_exists:
-                        current_agent["Vendor"] = "AMD"
-                        entries.append(current_agent)
-                current_agent = OrderedDict()
-                in_gpu_agent = False
-            elif ":" in line:
-                key, value = line.split(":", 1)
-                key = key.strip()
-                value = value.strip()
+                    # === Driver Information ===
+                    if "driver" in gpu_data and isinstance(gpu_data["driver"], dict):
+                        driver = gpu_data["driver"]
+                        if "name" in driver:
+                            record["Driver Name"] = driver["name"]
+                        if "version" in driver:
+                            record["Driver Version"] = driver["version"]
 
-                # Identify GPU agents
-                if key == "Marketing Name" and value:
-                    current_agent["Name"] = value
-                    in_gpu_agent = True
-                elif key == "Vendor Name" and ("AMD" in value or "Advanced Micro Devices" in value):
-                    in_gpu_agent = True
+                    # === Bus/PCIe Information ===
+                    if "bus" in gpu_data and isinstance(gpu_data["bus"], dict):
+                        bus = gpu_data["bus"]
+                        if "bdf" in bus:
+                            record["PCI BDF"] = bus["bdf"]
+                        if "max_pcie_width" in bus:
+                            record["Max PCIe Link Width"] = f"{bus['max_pcie_width']} lanes"
+                        if "max_pcie_speed" in bus:
+                            # Handle value/unit structure
+                            if isinstance(bus["max_pcie_speed"], dict):
+                                value = bus["max_pcie_speed"].get("value", "")
+                                unit = bus["max_pcie_speed"].get("unit", "")
+                                record["Max PCIe Speed"] = f"{value} {unit}".strip()
+                            else:
+                                record["Max PCIe Speed"] = str(bus["max_pcie_speed"])
+                        if "pcie_interface_version" in bus:
+                            record["PCIe Generation"] = bus["pcie_interface_version"]
+                        if "slot_type" in bus:
+                            record["Slot Type"] = bus["slot_type"]
 
-                # Only collect info for GPU agents
-                if in_gpu_agent:
-                    if key == "Chip ID" and value:
-                        current_agent["Chip ID"] = value
-                    elif key == "SIMD count" and value:
-                        current_agent["SIMD Count"] = value
-                    elif key == "Shader Engines" and value:
-                        current_agent["Shader Engines"] = value
-                    elif key == "Shader Arrs per Eng" and value:
-                        current_agent["Shader Arrays per Engine"] = value
-                    elif key == "Compute Unit" and value:
-                        if "Compute Units" not in current_agent:
-                            current_agent["Compute Units"] = value
-                    elif key == "SIMDs per CU" and value:
-                        current_agent["SIMDs per CU"] = value
-                    elif key == "Wavefront Size" and value:
-                        current_agent["Wavefront Size"] = value
-                    elif key == "Max Memory (MB)" and value:
-                        try:
-                            mem_mb = float(value)
-                            if "VRAM Size" not in current_agent:
-                                current_agent["VRAM Size"] = f"{mem_mb / 1024:.2f} GB"
-                        except ValueError:
-                            pass
-                    elif key == "Max Clock Freq. (MHz)" and value:
-                        current_agent["Max Clock Frequency"] = f"{value} MHz"
-                    elif key == "Device ID" and value:
-                        if "Device ID" not in current_agent:
-                            current_agent["Device ID"] = value
+                    # === VBIOS Information ===
+                    if "vbios" in gpu_data and isinstance(gpu_data["vbios"], dict):
+                        vbios = gpu_data["vbios"]
+                        if "version" in vbios:
+                            record["VBIOS Version"] = vbios["version"]
+                        if "part_number" in vbios:
+                            record["VBIOS Part Number"] = vbios["part_number"]
+                        if "build_date" in vbios:
+                            record["VBIOS Build Date"] = vbios["build_date"]
 
-        # Don't forget the last agent
-        if current_agent and current_agent.get("Name") and in_gpu_agent:
-            gpu_exists = False
-            for existing_gpu in entries:
-                if existing_gpu.get("Name") == current_agent.get("Name"):
-                    for key, value in current_agent.items():
-                        if key not in existing_gpu:
-                            existing_gpu[key] = value
-                    gpu_exists = True
-                    break
-            if not gpu_exists:
-                current_agent["Vendor"] = "AMD"
-                entries.append(current_agent)
+                    # === Board Information ===
+                    if "board" in gpu_data and isinstance(gpu_data["board"], dict):
+                        board = gpu_data["board"]
+                        if "model_number" in board:
+                            record["Board Model"] = board["model_number"]
+                        if "product_serial" in board:
+                            record["Board Serial"] = board["product_serial"]
+                        if "product_name" in board:
+                            record["Board Name"] = board["product_name"]
+                        if "manufacturer_name" in board:
+                            record["Board Manufacturer"] = board["manufacturer_name"]
 
-    lspci = run_command(["lspci", "-nn"])
-    if lspci:
-        for line in lspci.splitlines():
-            line = line.strip()
-            lowered = line.lower()
-            if "vga compatible controller" in lowered or "3d controller" in lowered or "display controller" in lowered:
-                record = OrderedDict()
-                parts = line.split(" ", 1)
-                record["Slot"] = parts[0]
-                if len(parts) > 1:
-                    record["Description"] = parts[1].strip()
-                entries.append(record)
+                    # === VRAM Information ===
+                    if "vram" in gpu_data and isinstance(gpu_data["vram"], dict):
+                        vram = gpu_data["vram"]
+                        if "size" in vram:
+                            # Handle value/unit structure
+                            if isinstance(vram["size"], dict):
+                                value = vram["size"].get("value", "")
+                                unit = vram["size"].get("unit", "")
+                                record["VRAM Size"] = f"{value} {unit}".strip()
+                            else:
+                                try:
+                                    vram_mb = int(vram["size"])
+                                    record["VRAM Size"] = f"{vram_mb / 1024:.2f} GB"
+                                except (ValueError, TypeError):
+                                    record["VRAM Size"] = str(vram["size"])
+                        if "type" in vram:
+                            record["VRAM Type"] = vram["type"]
+                        if "vendor" in vram:
+                            record["VRAM Vendor"] = vram["vendor"]
+                        if "bit_width" in vram:
+                            record["VRAM Bit Width"] = f"{vram['bit_width']}-bit"
+                        if "max_bandwidth" in vram:
+                            # Handle value/unit structure
+                            if isinstance(vram["max_bandwidth"], dict):
+                                value = vram["max_bandwidth"].get("value", "")
+                                unit = vram["max_bandwidth"].get("unit", "")
+                                record["VRAM Max Bandwidth"] = f"{value} {unit}".strip()
+                            else:
+                                record["VRAM Max Bandwidth"] = str(vram["max_bandwidth"])
+
+                    # === Cache Information ===
+                    if "cache_info" in gpu_data and isinstance(gpu_data["cache_info"], list):
+                        for cache_data in gpu_data["cache_info"]:
+                            if isinstance(cache_data, dict):
+                                cache_level = cache_data.get("cache_level", "")
+                                cache_id = cache_data.get("cache", "")
+                                cache_props = cache_data.get("cache_properties", [])
+
+                                # Build cache label
+                                if cache_props and isinstance(cache_props, list):
+                                    props_str = ", ".join(cache_props)
+                                    cache_label = f"L{cache_level} Cache ({props_str})"
+                                else:
+                                    cache_label = f"L{cache_level} Cache {cache_id}"
+
+                                # Handle cache size with value/unit structure
+                                if "cache_size" in cache_data:
+                                    if isinstance(cache_data["cache_size"], dict):
+                                        value = cache_data["cache_size"].get("value", "")
+                                        unit = cache_data["cache_size"].get("unit", "")
+                                        record[f"{cache_label} Size"] = f"{value} {unit}".strip()
+                                    else:
+                                        record[f"{cache_label} Size"] = str(cache_data["cache_size"])
+
+                                if "num_cache_instance" in cache_data:
+                                    record[f"{cache_label} Instances"] = str(cache_data["num_cache_instance"])
+
+                    # === Power and Thermal Limits ===
+                    if "limit" in gpu_data and isinstance(gpu_data["limit"], dict):
+                        limit = gpu_data["limit"]
+
+                        # Power limits
+                        for power_field, label in [
+                            ("max_power", "Max Power"),
+                            ("min_power", "Min Power"),
+                            ("socket_power", "Socket Power")
+                        ]:
+                            if power_field in limit:
+                                if isinstance(limit[power_field], dict):
+                                    value = limit[power_field].get("value", "")
+                                    unit = limit[power_field].get("unit", "")
+                                    record[label] = f"{value} {unit}".strip()
+                                else:
+                                    record[label] = str(limit[power_field])
+
+                        # Temperature limits
+                        for temp_field, label in [
+                            ("slowdown_edge_temperature", "Slowdown Edge Temperature"),
+                            ("slowdown_hotspot_temperature", "Slowdown Hotspot Temperature"),
+                            ("slowdown_vram_temperature", "Slowdown VRAM Temperature"),
+                            ("shutdown_edge_temperature", "Shutdown Edge Temperature"),
+                            ("shutdown_hotspot_temperature", "Shutdown Hotspot Temperature"),
+                            ("shutdown_vram_temperature", "Shutdown VRAM Temperature")
+                        ]:
+                            if temp_field in limit:
+                                if isinstance(limit[temp_field], dict):
+                                    value = limit[temp_field].get("value", "")
+                                    unit = limit[temp_field].get("unit", "")
+                                    record[label] = f"{value}°{unit}".strip("°")
+                                else:
+                                    temp_val = limit[temp_field]
+                                    if temp_val != "N/A":
+                                        record[label] = str(temp_val)
+
+                    # === NUMA Information ===
+                    if "numa" in gpu_data and isinstance(gpu_data["numa"], dict):
+                        numa = gpu_data["numa"]
+                        if "node" in numa:
+                            record["NUMA Node"] = str(numa["node"])
+                        if "affinity" in numa:
+                            record["NUMA Affinity"] = str(numa["affinity"])
+                        if "cpu_affinity" in numa and isinstance(numa["cpu_affinity"], dict):
+                            cpu_cores = []
+                            for cpu_list_data in numa["cpu_affinity"].values():
+                                if isinstance(cpu_list_data, dict) and "cpu_cores_affinity" in cpu_list_data:
+                                    cores = cpu_list_data["cpu_cores_affinity"]
+                                    if cores != "N/A":
+                                        cpu_cores.append(cores)
+                            if cpu_cores:
+                                record["CPU Cores Affinity"] = ", ".join(cpu_cores)
+
+                    # === Partition Information (SR-IOV) ===
+                    if "partition" in gpu_data and isinstance(gpu_data["partition"], dict):
+                        partition = gpu_data["partition"]
+                        if "partition_id" in partition:
+                            record["Partition ID"] = str(partition["partition_id"])
+                        if "partition_type" in partition:
+                            record["Partition Type"] = partition["partition_type"]
+                        if "num_partitions" in partition:
+                            record["Number of Partitions"] = str(partition["num_partitions"])
+
+                    # === Firmware Versions ===
+                    if "fw_version" in gpu_data and isinstance(gpu_data["fw_version"], dict):
+                        fw = gpu_data["fw_version"]
+                        for fw_component, fw_version in fw.items():
+                            if fw_version and str(fw_version).strip():
+                                record[f"FW {fw_component}"] = str(fw_version)
+
+                    # === RAS Information ===
+                    if "ras" in gpu_data and isinstance(gpu_data["ras"], dict):
+                        ras = gpu_data["ras"]
+                        if "eeprom_version" in ras:
+                            record["RAS EEPROM Version"] = str(ras["eeprom_version"])
+                        if "parity_schema" in ras:
+                            record["RAS Parity Schema"] = ras["parity_schema"]
+                        if "single_bit_schema" in ras:
+                            record["RAS Single-Bit Schema"] = ras["single_bit_schema"]
+                        if "double_bit_schema" in ras:
+                            record["RAS Double-Bit Schema"] = ras["double_bit_schema"]
+                        if "poison_schema" in ras:
+                            record["RAS Poison Schema"] = ras["poison_schema"]
+
+                        # ECC block states
+                        if "ecc_block_state" in ras and isinstance(ras["ecc_block_state"], dict):
+                            ecc_enabled = []
+                            ecc_disabled = []
+                            for block_name, block_state in ras["ecc_block_state"].items():
+                                if block_state == "ENABLED":
+                                    ecc_enabled.append(block_name)
+                                elif block_state == "DISABLED":
+                                    ecc_disabled.append(block_name)
+                            if ecc_enabled:
+                                record["ECC Enabled Blocks"] = ", ".join(ecc_enabled)
+                            if ecc_disabled:
+                                record["ECC Disabled Blocks"] = ", ".join(ecc_disabled)
+
+                    # === Additional GPU Features ===
+                    if "process_isolation" in gpu_data:
+                        process_iso = gpu_data["process_isolation"]
+                        if process_iso and process_iso != "N/A":
+                            record["Process Isolation"] = process_iso
+
+                    if "soc_pstate" in gpu_data:
+                        soc_pstate = gpu_data["soc_pstate"]
+                        if soc_pstate and soc_pstate != "N/A":
+                            record["SoC P-State"] = soc_pstate
+
+                    if "xgmi_plpd" in gpu_data:
+                        xgmi_plpd = gpu_data["xgmi_plpd"]
+                        if xgmi_plpd and xgmi_plpd != "N/A":
+                            record["XGMI PLPD"] = xgmi_plpd
+
+                    entries.append(record)
+            elif isinstance(data, dict):
+                parse_error_details = f"amd-smi JSON missing 'gpu_data' key. Available keys: {list(data.keys())}"
+            else:
+                parse_error_details = f"amd-smi returned unexpected JSON type: {type(data).__name__}"
+        except json.JSONDecodeError as e:
+            parse_error_details = f"JSON parsing failed: {e.msg} at line {e.lineno}, column {e.colno}"
+        except Exception as e:
+            parse_error_details = f"Unexpected error parsing amd-smi output: {str(e)}"
+
+    # === XGMI/Topology Information ===
+    xgmi_info = OrderedDict()
+    xgmi_info["Section"] = "XGMI Topology and Interconnect"
+    amd_smi_topology = run_command(["amd-smi", "topology", "--json"])
+    if amd_smi_topology:
+        try:
+            topo_data = json.loads(amd_smi_topology)
+            if isinstance(topo_data, dict):
+                for gpu_id, topo_info in topo_data.items():
+                    if isinstance(topo_info, dict):
+                        # XGMI links information
+                        if "xgmi" in topo_info and isinstance(topo_info["xgmi"], dict):
+                            xgmi = topo_info["xgmi"]
+                            gpu_label = f"{gpu_id} XGMI"
+                            xgmi_details = []
+                            if "num_hops" in xgmi:
+                                xgmi_details.append(f"Hops: {xgmi['num_hops']}")
+                            if "link_type" in xgmi:
+                                xgmi_details.append(f"Type: {xgmi['link_type']}")
+                            if "link_count" in xgmi:
+                                xgmi_details.append(f"Links: {xgmi['link_count']}")
+                            if "bandwidth" in xgmi:
+                                xgmi_details.append(f"Bandwidth: {xgmi['bandwidth']}")
+                            if xgmi_details:
+                                xgmi_info[gpu_label] = ", ".join(xgmi_details)
+
+                        # Access table (which GPUs can access each other)
+                        if "access_table" in topo_info and isinstance(topo_info["access_table"], dict):
+                            for peer_gpu, access_type in topo_info["access_table"].items():
+                                xgmi_info[f"{gpu_id} → {peer_gpu}"] = str(access_type)
+
+                        # Weight table (topology distance/cost)
+                        if "weight" in topo_info and isinstance(topo_info["weight"], dict):
+                            for peer_gpu, weight in topo_info["weight"].items():
+                                xgmi_info[f"{gpu_id} ↔ {peer_gpu} Weight"] = str(weight)
+        except json.JSONDecodeError:
+            pass
+
+    if len(xgmi_info) > 1:
+        entries.append(xgmi_info)
+
+    # === Firmware Information ===
+    fw_info = OrderedDict()
+    fw_info["Section"] = "Firmware and Microcode Versions"
+    amd_smi_firmware = run_command(["amd-smi", "firmware", "--json"])
+    if amd_smi_firmware:
+        try:
+            fw_data = json.loads(amd_smi_firmware)
+            if isinstance(fw_data, dict):
+                for gpu_id, fw_versions in fw_data.items():
+                    if isinstance(fw_versions, dict):
+                        for fw_component, version in fw_versions.items():
+                            if version and str(version).strip():
+                                fw_info[f"{gpu_id} {fw_component}"] = str(version)
+        except json.JSONDecodeError:
+            pass
+
+    if len(fw_info) > 1:
+        entries.append(fw_info)
+
+    # Add error info if no amd-smi data was collected
+    if not entries:
+        error_info = OrderedDict()
+        error_info["Section"] = "GPU Information - Error"
+        if not amd_smi_static:
+            error_info["Message"] = "amd-smi static returned no data. Please ensure ROCm and amd-smi are installed."
+        elif parse_error_details:
+            error_info["Message"] = f"Failed to parse amd-smi output: {parse_error_details}"
+            error_info["Troubleshooting"] = "Try running 'amd-smi static --json' manually to see the raw output"
+        else:
+            error_info["Message"] = "amd-smi commands ran but no GPU data was found"
+            error_info["Possible Causes"] = "No AMD GPUs detected, or GPU data was filtered out"
+        entries.append(error_info)
+
     return entries
 
 def mac_gpu_info() -> List[Dict[str, str]]:
@@ -457,221 +818,477 @@ def gather_gpu_details() -> Dict[str, List[Dict[str, str]]]:
     return details
 
 def windows_network_info() -> List[Dict[str, str]]:
+    """Collect detailed network interface information for Windows."""
     entries: List[Dict[str, str]] = []
-    ipconfig = run_command(["ipconfig", "/all"])
-    if ipconfig:
-        current = OrderedDict()
-        for line in ipconfig.splitlines():
-            line_stripped = line.strip()
-            if not line_stripped:
-                if current and current.get("Adapter"):
-                    entries.append(current)
-                    current = OrderedDict()
-                continue
 
-            # Check for adapter header (starts at beginning of line, ends with colon)
-            if line and not line[0].isspace() and line.rstrip().endswith(":"):
-                if current and current.get("Adapter"):
-                    entries.append(current)
-                current = OrderedDict()
-                current["Adapter"] = line.rstrip(":").strip()
-            elif ":" in line_stripped:
-                key, value = line_stripped.split(":", 1)
-                key = key.strip().rstrip(".")
-                value = value.strip()
-                if value:
-                    current[key] = value
+    # Use PowerShell to get comprehensive adapter information
+    ps_command = """
+    Get-NetAdapter | ForEach-Object {
+        $adapter = $_
+        $ipConfig = Get-NetIPAddress -InterfaceIndex $adapter.ifIndex -ErrorAction SilentlyContinue
+        $stats = Get-NetAdapterStatistics -Name $adapter.Name -ErrorAction SilentlyContinue
 
-        if current and current.get("Adapter"):
-            entries.append(current)
+        [PSCustomObject]@{
+            Name = $adapter.Name
+            Status = $adapter.Status
+            MacAddress = $adapter.MacAddress
+            LinkSpeed = $adapter.LinkSpeed
+            MediaType = $adapter.MediaType
+            InterfaceDescription = $adapter.InterfaceDescription
+            DriverVersion = $adapter.DriverVersion
+            DriverDate = $adapter.DriverDate
+            DriverProvider = $adapter.DriverProvider
+            IPv4Address = ($ipConfig | Where-Object {$_.AddressFamily -eq 'IPv4'} | Select-Object -First 1).IPAddress
+            IPv6Address = ($ipConfig | Where-Object {$_.AddressFamily -eq 'IPv6'} | Select-Object -First 1).IPAddress
+            ReceivedBytes = $stats.ReceivedBytes
+            SentBytes = $stats.SentBytes
+            ReceivedPackets = $stats.ReceivedUnicastPackets
+            SentPackets = $stats.SentUnicastPackets
+        }
+    } | ConvertTo-Json
+    """
 
-    # Try PowerShell as alternative
-    if not entries:
-        ps = run_command([
-            "powershell",
-            "-NoProfile",
-            "-Command",
-            "(Get-NetAdapter | Select-Object Name,Status,MacAddress,LinkSpeed,InterfaceDescription) | ConvertTo-Json -Compress"
-        ])
-        if ps:
-            try:
-                data = json.loads(ps)
-                if isinstance(data, dict):
-                    data = [data]
-                for adapter in data:
-                    record = OrderedDict()
-                    for key, value in adapter.items():
-                        if value not in (None, ""):
-                            record[key] = str(value)
-                    if record:
-                        entries.append(record)
-            except json.JSONDecodeError:
-                pass
+    ps = run_command([
+        "powershell",
+        "-NoProfile",
+        "-Command",
+        ps_command
+    ])
+
+    if ps:
+        try:
+            data = json.loads(ps)
+            if isinstance(data, dict):
+                data = [data]
+
+            for adapter in data:
+                record = OrderedDict()
+
+                if "Name" in adapter:
+                    record["Interface"] = adapter["Name"]
+
+                if "Status" in adapter:
+                    record["Status"] = adapter["Status"]
+
+                if "MacAddress" in adapter and adapter["MacAddress"]:
+                    record["MAC Address"] = adapter["MacAddress"]
+
+                if "LinkSpeed" in adapter and adapter["LinkSpeed"]:
+                    record["Link Speed"] = adapter["LinkSpeed"]
+
+                if "MediaType" in adapter and adapter["MediaType"]:
+                    record["Media Type"] = adapter["MediaType"]
+
+                if "InterfaceDescription" in adapter and adapter["InterfaceDescription"]:
+                    record["Description"] = adapter["InterfaceDescription"]
+
+                if "IPv4Address" in adapter and adapter["IPv4Address"]:
+                    record["IPv4 Address"] = adapter["IPv4Address"]
+
+                if "IPv6Address" in adapter and adapter["IPv6Address"]:
+                    record["IPv6 Address"] = adapter["IPv6Address"]
+
+                if "DriverVersion" in adapter and adapter["DriverVersion"]:
+                    record["Driver Version"] = adapter["DriverVersion"]
+
+                if "DriverProvider" in adapter and adapter["DriverProvider"]:
+                    record["Driver Provider"] = adapter["DriverProvider"]
+
+                # Format statistics
+                def format_bytes(b):
+                    if not b:
+                        return None
+                    b = int(b)
+                    if b >= 1024**4:
+                        return f"{b / (1024**4):.2f} TB"
+                    elif b >= 1024**3:
+                        return f"{b / (1024**3):.2f} GB"
+                    elif b >= 1024**2:
+                        return f"{b / (1024**2):.2f} MB"
+                    elif b >= 1024:
+                        return f"{b / 1024:.2f} KB"
+                    else:
+                        return f"{b} B"
+
+                if "ReceivedBytes" in adapter and adapter["ReceivedBytes"]:
+                    formatted = format_bytes(adapter["ReceivedBytes"])
+                    if formatted:
+                        record["RX Bytes"] = formatted
+
+                if "SentBytes" in adapter and adapter["SentBytes"]:
+                    formatted = format_bytes(adapter["SentBytes"])
+                    if formatted:
+                        record["TX Bytes"] = formatted
+
+                if "ReceivedPackets" in adapter and adapter["ReceivedPackets"]:
+                    try:
+                        record["RX Packets"] = f"{int(adapter['ReceivedPackets']):,}"
+                    except (ValueError, TypeError):
+                        pass
+
+                if "SentPackets" in adapter and adapter["SentPackets"]:
+                    try:
+                        record["TX Packets"] = f"{int(adapter['SentPackets']):,}"
+                    except (ValueError, TypeError):
+                        pass
+
+                entries.append(record)
+
+        except json.JSONDecodeError:
+            pass
 
     return entries
 
 def linux_network_info() -> List[Dict[str, str]]:
+    """Collect detailed network interface information."""
     entries: List[Dict[str, str]] = []
 
-    # Try 'ip addr' first (modern Linux)
+    # Try 'ip -json' commands for comprehensive information
+    ip_link = run_command(["ip", "-json", "link"])
     ip_addr = run_command(["ip", "-json", "addr"])
-    if ip_addr:
+
+    link_data = {}
+    addr_data = {}
+
+    if ip_link:
         try:
-            data = json.loads(ip_addr)
-            for interface in data:
-                record = OrderedDict()
-                if "ifname" in interface:
-                    record["Interface"] = interface["ifname"]
-                if "address" in interface:
-                    record["MAC Address"] = interface["address"]
-                if "operstate" in interface:
-                    record["State"] = interface["operstate"]
-                if "mtu" in interface:
-                    record["MTU"] = str(interface["mtu"])
-
-                # Extract IP addresses
-                ipv4_addrs = []
-                ipv6_addrs = []
-                if "addr_info" in interface:
-                    for addr in interface["addr_info"]:
-                        if addr.get("family") == "inet":
-                            ipv4_addrs.append(f"{addr.get('local')}/{addr.get('prefixlen', '')}")
-                        elif addr.get("family") == "inet6":
-                            ipv6_addrs.append(f"{addr.get('local')}/{addr.get('prefixlen', '')}")
-
-                if ipv4_addrs:
-                    record["IPv4 Addresses"] = ", ".join(ipv4_addrs)
-                if ipv6_addrs:
-                    record["IPv6 Addresses"] = ", ".join(ipv6_addrs)
-
-                if record:
-                    entries.append(record)
+            link_data = {iface["ifname"]: iface for iface in json.loads(ip_link)}
         except json.JSONDecodeError:
             pass
 
-    # Fallback to 'ip addr' without JSON
-    if not entries:
-        ip_addr_text = run_command(["ip", "addr"])
-        if ip_addr_text:
-            current = OrderedDict()
-            for line in ip_addr_text.splitlines():
-                line = line.strip()
+    if ip_addr:
+        try:
+            addr_data = {iface["ifname"]: iface for iface in json.loads(ip_addr)}
+        except json.JSONDecodeError:
+            pass
 
-                # Interface line starts with number
+    # Merge link and addr data
+    all_interfaces = set(list(link_data.keys()) + list(addr_data.keys()))
+
+    for ifname in sorted(all_interfaces):
+        record = OrderedDict()
+        record["Interface"] = ifname
+
+        # Get link information
+        if ifname in link_data:
+            link = link_data[ifname]
+
+            # Operational state
+            if "operstate" in link:
+                record["State"] = link["operstate"]
+
+            # MAC address
+            if "address" in link:
+                record["MAC Address"] = link["address"]
+
+            # Link type
+            if "link_type" in link:
+                record["Type"] = link["link_type"]
+
+            # MTU
+            if "mtu" in link:
+                record["MTU"] = str(link["mtu"])
+
+            # Speed (if available)
+            if "speed" in link and link["speed"] > 0:
+                speed = link["speed"]
+                if speed >= 1000:
+                    record["Speed"] = f"{speed / 1000:.0f} Gbps"
+                else:
+                    record["Speed"] = f"{speed} Mbps"
+
+        # Get address information
+        if ifname in addr_data:
+            addr = addr_data[ifname]
+
+            # IPv4 and IPv6 addresses
+            ipv4_addrs = []
+            ipv6_addrs = []
+
+            if "addr_info" in addr:
+                for addr_info in addr["addr_info"]:
+                    if "family" in addr_info and "local" in addr_info:
+                        if addr_info["family"] == "inet":
+                            prefix = addr_info.get("prefixlen", "")
+                            ipv4_addrs.append(f"{addr_info['local']}/{prefix}" if prefix else addr_info['local'])
+                        elif addr_info["family"] == "inet6":
+                            prefix = addr_info.get("prefixlen", "")
+                            ipv6_addrs.append(f"{addr_info['local']}/{prefix}" if prefix else addr_info['local'])
+
+            if ipv4_addrs:
+                record["IPv4 Address"] = ", ".join(ipv4_addrs)
+            if ipv6_addrs:
+                record["IPv6 Address"] = ", ".join(ipv6_addrs[:2])  # Limit to first 2 IPv6 addresses
+
+        # Get additional details from ethtool (if available)
+        ethtool_output = run_command(["ethtool", ifname])
+        if ethtool_output:
+            for line in ethtool_output.splitlines():
+                line = line.strip()
+                if "Speed:" in line and "Speed" not in record:
+                    speed_match = line.split("Speed:")
+                    if len(speed_match) > 1:
+                        record["Speed"] = speed_match[1].strip()
+                elif "Duplex:" in line:
+                    duplex_match = line.split("Duplex:")
+                    if len(duplex_match) > 1:
+                        record["Duplex"] = duplex_match[1].strip()
+                elif "Link detected:" in line:
+                    link_match = line.split("Link detected:")
+                    if len(link_match) > 1:
+                        record["Link Detected"] = link_match[1].strip()
+
+        # Get driver information from ethtool -i
+        ethtool_driver = run_command(["ethtool", "-i", ifname])
+        if ethtool_driver:
+            for line in ethtool_driver.splitlines():
+                line = line.strip()
+                if line.startswith("driver:"):
+                    record["Driver"] = line.split(":", 1)[1].strip()
+                elif line.startswith("version:"):
+                    record["Driver Version"] = line.split(":", 1)[1].strip()
+                elif line.startswith("firmware-version:"):
+                    fw_version = line.split(":", 1)[1].strip()
+                    if fw_version and fw_version != "N/A":
+                        record["Firmware"] = fw_version
+                elif line.startswith("bus-info:"):
+                    record["PCI Address"] = line.split(":", 1)[1].strip()
+
+        # Get statistics
+        ethtool_stats = run_command(["ethtool", "-S", ifname])
+        if ethtool_stats:
+            rx_bytes = 0
+            tx_bytes = 0
+            rx_packets = 0
+            tx_packets = 0
+            rx_errors = 0
+            tx_errors = 0
+
+            for line in ethtool_stats.splitlines():
+                line = line.strip().lower()
+                if "rx_bytes:" in line or "rx bytes:" in line:
+                    try:
+                        rx_bytes = int(line.split(":")[-1].strip())
+                    except ValueError:
+                        pass
+                elif "tx_bytes:" in line or "tx bytes:" in line:
+                    try:
+                        tx_bytes = int(line.split(":")[-1].strip())
+                    except ValueError:
+                        pass
+                elif "rx_packets:" in line or "rx packets:" in line:
+                    try:
+                        rx_packets = int(line.split(":")[-1].strip())
+                    except ValueError:
+                        pass
+                elif "tx_packets:" in line or "tx packets:" in line:
+                    try:
+                        tx_packets = int(line.split(":")[-1].strip())
+                    except ValueError:
+                        pass
+                elif "rx_errors:" in line or "rx errors:" in line:
+                    try:
+                        rx_errors = int(line.split(":")[-1].strip())
+                    except ValueError:
+                        pass
+                elif "tx_errors:" in line or "tx errors:" in line:
+                    try:
+                        tx_errors = int(line.split(":")[-1].strip())
+                    except ValueError:
+                        pass
+
+            # Format bytes in human-readable format
+            def format_bytes(b):
+                if b >= 1024**4:
+                    return f"{b / (1024**4):.2f} TB"
+                elif b >= 1024**3:
+                    return f"{b / (1024**3):.2f} GB"
+                elif b >= 1024**2:
+                    return f"{b / (1024**2):.2f} MB"
+                elif b >= 1024:
+                    return f"{b / 1024:.2f} KB"
+                else:
+                    return f"{b} B"
+
+            if rx_bytes > 0:
+                record["RX Bytes"] = format_bytes(rx_bytes)
+            if tx_bytes > 0:
+                record["TX Bytes"] = format_bytes(tx_bytes)
+            if rx_packets > 0:
+                record["RX Packets"] = f"{rx_packets:,}"
+            if tx_packets > 0:
+                record["TX Packets"] = f"{tx_packets:,}"
+            if rx_errors > 0:
+                record["RX Errors"] = f"{rx_errors:,}"
+            if tx_errors > 0:
+                record["TX Errors"] = f"{tx_errors:,}"
+
+        if record:
+            entries.append(record)
+
+    # Fallback to basic 'ip link' without JSON if no interfaces found
+    if not entries:
+        ip_link_text = run_command(["ip", "link"])
+        if ip_link_text:
+            for line in ip_link_text.splitlines():
+                line = line.strip()
                 if line and line[0].isdigit() and ":" in line:
-                    if current and current.get("Interface"):
-                        entries.append(current)
                     parts = line.split(":", 2)
                     if len(parts) >= 2:
-                        current = OrderedDict()
-                        current["Interface"] = parts[1].strip().split("@")[0]
+                        record = OrderedDict()
+                        record["Interface"] = parts[1].strip().split("@")[0]
                         if "state" in line.upper():
                             state_part = line.split("state")
                             if len(state_part) > 1:
-                                current["State"] = state_part[1].strip().split()[0]
-                elif line.startswith("link/ether"):
-                    parts = line.split()
-                    if len(parts) >= 2:
-                        current["MAC Address"] = parts[1]
-                elif line.startswith("inet "):
-                    parts = line.split()
-                    if len(parts) >= 2:
-                        if "IPv4 Addresses" in current:
-                            current["IPv4 Addresses"] += f", {parts[1]}"
-                        else:
-                            current["IPv4 Addresses"] = parts[1]
-                elif line.startswith("inet6"):
-                    parts = line.split()
-                    if len(parts) >= 2:
-                        if "IPv6 Addresses" in current:
-                            current["IPv6 Addresses"] += f", {parts[1]}"
-                        else:
-                            current["IPv6 Addresses"] = parts[1]
-
-            if current and current.get("Interface"):
-                entries.append(current)
-
-    # Additional info from ethtool (if available)
-    for entry in entries:
-        interface_name = entry.get("Interface")
-        if interface_name:
-            ethtool = run_command(["ethtool", interface_name])
-            if ethtool:
-                for line in ethtool.splitlines():
-                    if "Speed:" in line:
-                        entry["Link Speed"] = line.split("Speed:", 1)[1].strip()
-                    elif "Link detected:" in line:
-                        entry["Link Detected"] = line.split("Link detected:", 1)[1].strip()
+                                record["Status"] = state_part[1].strip().split()[0]
+                        entries.append(record)
 
     return entries
 
 def mac_network_info() -> List[Dict[str, str]]:
+    """Collect detailed network interface information for macOS."""
     entries: List[Dict[str, str]] = []
 
-    # Use networksetup to list interfaces
-    networksetup = run_command(["networksetup", "-listallhardwareports"])
-    ifconfig_output = run_command(["ifconfig"])
-
-    interfaces = {}
-    if networksetup:
-        current_port = None
-        for line in networksetup.splitlines():
-            line = line.strip()
-            if line.startswith("Hardware Port:"):
-                current_port = line.split(":", 1)[1].strip()
-                interfaces[current_port] = OrderedDict()
-                interfaces[current_port]["Hardware Port"] = current_port
-            elif line.startswith("Device:") and current_port:
-                device = line.split(":", 1)[1].strip()
-                interfaces[current_port]["Device"] = device
-            elif line.startswith("Ethernet Address:") and current_port:
-                mac = line.split(":", 1)[1].strip()
-                interfaces[current_port]["MAC Address"] = mac
-
-    # Parse ifconfig for additional details
+    # Use ifconfig to get detailed interface information
+    ifconfig_output = run_command(["ifconfig", "-a"])
     if ifconfig_output:
-        current_interface = None
-        for line in ifconfig_output.splitlines():
-            if line and not line[0].isspace():
-                parts = line.split(":")
-                if parts:
-                    current_interface = parts[0].strip()
-                    # Find matching entry or create new one
-                    found = False
-                    for port_data in interfaces.values():
-                        if port_data.get("Device") == current_interface:
-                            found = True
-                            break
-                    if not found:
-                        interfaces[current_interface] = OrderedDict()
-                        interfaces[current_interface]["Interface"] = current_interface
-            elif current_interface and line.strip():
-                line = line.strip()
-                if line.startswith("inet "):
-                    parts = line.split()
-                    if len(parts) >= 2:
-                        for port_data in interfaces.values():
-                            if port_data.get("Device") == current_interface or port_data.get("Interface") == current_interface:
-                                port_data["IPv4 Address"] = parts[1]
-                elif line.startswith("inet6"):
-                    parts = line.split()
-                    if len(parts) >= 2:
-                        for port_data in interfaces.values():
-                            if port_data.get("Device") == current_interface or port_data.get("Interface") == current_interface:
-                                if "IPv6 Address" in port_data:
-                                    port_data["IPv6 Address"] += f", {parts[1]}"
-                                else:
-                                    port_data["IPv6 Address"] = parts[1]
-                elif line.startswith("status:"):
-                    status = line.split(":", 1)[1].strip()
-                    for port_data in interfaces.values():
-                        if port_data.get("Device") == current_interface or port_data.get("Interface") == current_interface:
-                            port_data["Status"] = status
+        record = None
 
-    entries = list(interfaces.values())
+        for line in ifconfig_output.splitlines():
+            # New interface starts (line doesn't start with whitespace)
+            if line and not line[0].isspace():
+                # Save previous interface
+                if record:
+                    entries.append(record)
+
+                # Start new interface
+                parts = line.split(":", 1)
+                interface_name = parts[0].strip()
+                record = OrderedDict()
+                record["Interface"] = interface_name
+
+                # Parse flags from first line
+                if "flags=" in line:
+                    if "UP" in line and "RUNNING" in line:
+                        record["Status"] = "UP"
+                    elif "UP" in line:
+                        record["Status"] = "UP (not running)"
+                    else:
+                        record["Status"] = "DOWN"
+
+                # Parse MTU
+                if "mtu" in line.lower():
+                    mtu_match = line.lower().split("mtu")
+                    if len(mtu_match) > 1:
+                        mtu_parts = mtu_match[1].strip().split()
+                        if mtu_parts:
+                            record["MTU"] = mtu_parts[0]
+
+            elif record and line.strip():
+                line = line.strip()
+
+                # MAC address (ether)
+                if line.startswith("ether "):
+                    mac = line.split()[1] if len(line.split()) > 1 else ""
+                    if mac:
+                        record["MAC Address"] = mac
+
+                # IPv4 address
+                elif line.startswith("inet "):
+                    parts = line.split()
+                    if len(parts) > 1:
+                        ip_addr = parts[1]
+                        netmask = ""
+                        if "netmask" in line and len(parts) > 3:
+                            netmask = parts[3]
+                        if netmask and netmask.startswith("0x"):
+                            # Convert hex netmask to CIDR
+                            try:
+                                mask_int = int(netmask, 16)
+                                cidr = bin(mask_int).count('1')
+                                record["IPv4 Address"] = f"{ip_addr}/{cidr}"
+                            except ValueError:
+                                record["IPv4 Address"] = ip_addr
+                        else:
+                            record["IPv4 Address"] = ip_addr
+
+                # IPv6 address
+                elif line.startswith("inet6 "):
+                    parts = line.split()
+                    if len(parts) > 1:
+                        ipv6_addr = parts[1]
+                        if "IPv6 Address" not in record:
+                            record["IPv6 Address"] = ipv6_addr
+
+                # Media type and status
+                elif line.startswith("media:"):
+                    media_info = line.replace("media:", "").strip()
+                    record["Media"] = media_info
+
+                elif line.startswith("status:"):
+                    status_info = line.replace("status:", "").strip()
+                    record["Link Status"] = status_info
+
+        # Append last interface
+        if record:
+            entries.append(record)
+
+    # Get additional network statistics using netstat
+    netstat_output = run_command(["netstat", "-ibn"])
+    if netstat_output and entries:
+        lines = netstat_output.splitlines()
+        if len(lines) > 1:
+            # Parse header to find column positions
+            for line in lines[1:]:
+                parts = line.split()
+                if len(parts) >= 7:
+                    iface_name = parts[0]
+                    # Find matching interface in entries
+                    for entry in entries:
+                        if entry.get("Interface") == iface_name:
+                            # Format bytes
+                            def format_bytes(b):
+                                try:
+                                    b = int(b)
+                                    if b >= 1024**4:
+                                        return f"{b / (1024**4):.2f} TB"
+                                    elif b >= 1024**3:
+                                        return f"{b / (1024**3):.2f} GB"
+                                    elif b >= 1024**2:
+                                        return f"{b / (1024**2):.2f} MB"
+                                    elif b >= 1024:
+                                        return f"{b / 1024:.2f} KB"
+                                    else:
+                                        return f"{b} B"
+                                except (ValueError, TypeError):
+                                    return None
+
+                            try:
+                                # columns: Name Mtu Network Address Ipkts Ierrs Ibytes Opkts Oerrs Obytes
+                                if len(parts) >= 10:
+                                    ipkts = parts[4]
+                                    ibytes = parts[6]
+                                    opkts = parts[7]
+                                    obytes = parts[9]
+
+                                    rx_bytes_formatted = format_bytes(ibytes)
+                                    if rx_bytes_formatted:
+                                        entry["RX Bytes"] = rx_bytes_formatted
+
+                                    tx_bytes_formatted = format_bytes(obytes)
+                                    if tx_bytes_formatted:
+                                        entry["TX Bytes"] = tx_bytes_formatted
+
+                                    entry["RX Packets"] = f"{int(ipkts):,}"
+                                    entry["TX Packets"] = f"{int(opkts):,}"
+                            except (ValueError, IndexError):
+                                pass
+                            break
+
     return entries
 
 def gather_network_details() -> Dict[str, List[Dict[str, str]]]:
+    """Gather network interface names only - simplified."""
     system = platform.system().lower()
     details: Dict[str, List[Dict[str, str]]] = OrderedDict()
 
@@ -688,22 +1305,214 @@ def gather_network_details() -> Dict[str, List[Dict[str, str]]]:
         if interfaces:
             details["macos"] = interfaces
 
-    # Add hostname
-    try:
-        hostname = socket.gethostname()
-        fqdn = socket.getfqdn()
-        system_info = OrderedDict()
-        system_info["hostname"] = hostname
-        if fqdn != hostname:
-            system_info["fqdn"] = fqdn
-        details["system"] = [system_info]
-    except Exception:
-        pass
+    return details
+
+def gather_bmc_info() -> Dict[str, List[Dict[str, str]]]:
+    """Gather BMC (Baseboard Management Controller) information using IPMI tools."""
+    details: Dict[str, List[Dict[str, str]]] = OrderedDict()
+    system = platform.system().lower()
+
+    # BMC information is primarily available on Linux servers
+    if system != "linux":
+        return details
+
+    bmc_list = []
+
+    # === BMC Device Information ===
+    # Check if ipmitool is available
+    ipmitool_version = run_command(["ipmitool", "-V"])
+    if not ipmitool_version:
+        return details
+
+    # BMC Info section
+    bmc_info = OrderedDict()
+    bmc_info["Section"] = "BMC Device Information"
+
+    # Get BMC device information
+    bmc_info_output = run_command(["ipmitool", "bmc", "info"])
+    if bmc_info_output:
+        for line in bmc_info_output.splitlines():
+            if ":" in line:
+                parts = line.split(":", 1)
+                if len(parts) == 2:
+                    key = parts[0].strip()
+                    value = parts[1].strip()
+                    if value and value != "0":
+                        bmc_info[key] = value
+
+    if len(bmc_info) > 1:  # More than just the Section
+        bmc_list.append(bmc_info)
+
+    # === BMC Network Configuration ===
+    lan_info = OrderedDict()
+    lan_info["Section"] = "BMC Network Configuration"
+
+    lan_output = run_command(["ipmitool", "lan", "print"])
+    if lan_output:
+        for line in lan_output.splitlines():
+            if ":" in line:
+                parts = line.split(":", 1)
+                if len(parts) == 2:
+                    key = parts[0].strip()
+                    value = parts[1].strip()
+                    if value:
+                        lan_info[key] = value
+
+    if len(lan_info) > 1:
+        bmc_list.append(lan_info)
+
+    # === Sensor Data Records (SDR) ===
+    sdr_output = run_command(["ipmitool", "sdr", "list"])
+    if sdr_output:
+        # Group sensors by type
+        temperature_sensors = OrderedDict()
+        temperature_sensors["Section"] = "Temperature Sensors"
+
+        voltage_sensors = OrderedDict()
+        voltage_sensors["Section"] = "Voltage Sensors"
+
+        fan_sensors = OrderedDict()
+        fan_sensors["Section"] = "Fan Sensors"
+
+        power_sensors = OrderedDict()
+        power_sensors["Section"] = "Power Sensors"
+
+        other_sensors = OrderedDict()
+        other_sensors["Section"] = "Other Sensors"
+
+        for line in sdr_output.splitlines():
+            if "|" in line:
+                parts = [p.strip() for p in line.split("|")]
+                if len(parts) >= 3:
+                    sensor_name = parts[0]
+                    sensor_value = parts[1]
+                    sensor_status = parts[2] if len(parts) > 2 else ""
+
+                    # Categorize by sensor name or value
+                    sensor_lower = sensor_name.lower()
+                    value_lower = sensor_value.lower()
+
+                    if "temp" in sensor_lower or "degrees" in value_lower or "°" in sensor_value:
+                        temperature_sensors[sensor_name] = f"{sensor_value} ({sensor_status})"
+                    elif "volt" in sensor_lower or "v" in value_lower:
+                        voltage_sensors[sensor_name] = f"{sensor_value} ({sensor_status})"
+                    elif "fan" in sensor_lower or "rpm" in value_lower:
+                        fan_sensors[sensor_name] = f"{sensor_value} ({sensor_status})"
+                    elif "power" in sensor_lower or "watt" in value_lower or "w" in value_lower:
+                        power_sensors[sensor_name] = f"{sensor_value} ({sensor_status})"
+                    else:
+                        other_sensors[sensor_name] = f"{sensor_value} ({sensor_status})"
+
+        # Add non-empty sensor groups
+        if len(temperature_sensors) > 1:
+            bmc_list.append(temperature_sensors)
+        if len(voltage_sensors) > 1:
+            bmc_list.append(voltage_sensors)
+        if len(fan_sensors) > 1:
+            bmc_list.append(fan_sensors)
+        if len(power_sensors) > 1:
+            bmc_list.append(power_sensors)
+        if len(other_sensors) > 1:
+            bmc_list.append(other_sensors)
+
+    # === FRU (Field Replaceable Unit) Information ===
+    fru_output = run_command(["ipmitool", "fru", "print"])
+    if fru_output:
+        current_fru = None
+        fru_record = None
+
+        for line in fru_output.splitlines():
+            line_stripped = line.strip()
+
+            # New FRU section (starts with "FRU Device Description")
+            if line_stripped.startswith("FRU Device Description"):
+                # Save previous FRU
+                if fru_record and len(fru_record) > 1:
+                    bmc_list.append(fru_record)
+
+                # Start new FRU
+                parts = line_stripped.split(":", 1)
+                if len(parts) == 2:
+                    current_fru = parts[1].strip()
+                    fru_record = OrderedDict()
+                    fru_record["Section"] = f"FRU: {current_fru}"
+
+            # FRU field
+            elif ":" in line_stripped and fru_record is not None:
+                parts = line_stripped.split(":", 1)
+                if len(parts) == 2:
+                    key = parts[0].strip()
+                    value = parts[1].strip()
+                    if value and value.lower() != "unspecified":
+                        fru_record[key] = value
+
+        # Save last FRU
+        if fru_record and len(fru_record) > 1:
+            bmc_list.append(fru_record)
+
+    # === System Event Log (SEL) Info ===
+    sel_info = OrderedDict()
+    sel_info["Section"] = "System Event Log (SEL) Information"
+
+    sel_info_output = run_command(["ipmitool", "sel", "info"])
+    if sel_info_output:
+        for line in sel_info_output.splitlines():
+            if ":" in line:
+                parts = line.split(":", 1)
+                if len(parts) == 2:
+                    key = parts[0].strip()
+                    value = parts[1].strip()
+                    if value:
+                        sel_info[key] = value
+
+    if len(sel_info) > 1:
+        bmc_list.append(sel_info)
+
+    # === Recent SEL Entries (last 10) ===
+    sel_list_output = run_command(["ipmitool", "sel", "list", "last", "10"])
+    if sel_list_output:
+        sel_entries = OrderedDict()
+        sel_entries["Section"] = "Recent System Events (Last 10)"
+
+        entry_count = 1
+        for line in sel_list_output.splitlines():
+            if line.strip():
+                # Format: ID | Date | Time | Sensor | Event | Status
+                sel_entries[f"Event {entry_count}"] = line.strip()
+                entry_count += 1
+
+        if len(sel_entries) > 1:
+            bmc_list.append(sel_entries)
+
+    # === Power Status ===
+    power_status = run_command(["ipmitool", "chassis", "power", "status"])
+    if power_status:
+        chassis_info = OrderedDict()
+        chassis_info["Section"] = "Chassis Power Information"
+        chassis_info["Power Status"] = power_status.strip()
+
+        # Get chassis status
+        chassis_status_output = run_command(["ipmitool", "chassis", "status"])
+        if chassis_status_output:
+            for line in chassis_status_output.splitlines():
+                if ":" in line:
+                    parts = line.split(":", 1)
+                    if len(parts) == 2:
+                        key = parts[0].strip()
+                        value = parts[1].strip()
+                        if value:
+                            chassis_info[key] = value
+
+        if len(chassis_info) > 1:
+            bmc_list.append(chassis_info)
+
+    if bmc_list:
+        details["bmc"] = bmc_list
 
     return details
 
-def gather_gpu_microbenchmarks() -> Dict[str, List[Dict[str, str]]]:
-    """Gather GPU microbenchmark information including supported data formats."""
+def gather_gpu_microbenchmarks(include_p2p: bool = False, verbose: bool = True) -> Dict[str, List[Dict[str, str]]]:
+    """Gather GPU microbenchmark information including peak performance and optionally GPU-to-GPU communication."""
     details: Dict[str, List[Dict[str, str]]] = OrderedDict()
     system = platform.system().lower()
 
@@ -713,108 +1522,313 @@ def gather_gpu_microbenchmarks() -> Dict[str, List[Dict[str, str]]]:
 
     microbenchmark_list = []
 
-    # Supported Data Formats
-    formats_info = OrderedDict()
-    formats_info["Section"] = "Supported Data Formats"
+    # Peak Performance Benchmarks
+    roofline_info = OrderedDict()
+    roofline_info["Section"] = "Peak Performance"
 
-    # Check for AMD GPU architecture support from rocminfo
+    # Get GPU specifications for roofline calculations from rocminfo
     rocminfo_output = run_command(["rocminfo"])
     if rocminfo_output:
         current_gpu = None
-        gpu_formats = OrderedDict()
+        gfx_version = None
+        compute_units = None
+        max_clock_freq = None
+        max_memory = None
 
         for line in rocminfo_output.splitlines():
             line = line.strip()
 
             if line.startswith("*******"):
-                # Save previous GPU if exists
-                if current_gpu and gpu_formats:
-                    formats_info[current_gpu] = ", ".join(gpu_formats.values())
+                # Process previous GPU
+                if current_gpu and compute_units:
+                    gpu_key = f"{current_gpu}"
+                    if gfx_version:
+                        gpu_key += f" ({gfx_version})"
+
+                    # Calculate maximum theoretical performance
+                    # Standard assumption: 128 FP32 ops per CU per clock (64 SPs * 2 ops/clock FMA)
+                    ops_per_cu_per_clock = 128
+
+                    # Use detected or estimated clock frequency
+                    base_clock = max_clock_freq if max_clock_freq else 1500  # Default 1.5 GHz if not detected
+
+                    # Calculate FP32 peak performance
+                    fp32_tflops = (compute_units * ops_per_cu_per_clock * base_clock) / 1e6
+                    roofline_info[f"{gpu_key} - Compute Units"] = str(compute_units)
+                    roofline_info[f"{gpu_key} - Max Clock Frequency"] = f"{base_clock:.0f} MHz"
+                    roofline_info[f"{gpu_key} - FP32 Peak"] = f"{fp32_tflops:.2f} TFLOPS"
+
+                    # FP64 Peak (architecture-dependent ratio)
+                    if gfx_version and any(arch in gfx_version.lower() for arch in ["gfx90a", "gfx940", "gfx941", "gfx942"]):
+                        # CDNA: 1:1 ratio
+                        roofline_info[f"{gpu_key} - FP64 Peak"] = f"{fp32_tflops:.2f} TFLOPS (1:1)"
+                    elif gfx_version and any(arch in gfx_version.lower() for arch in ["gfx900", "gfx906", "gfx908"]):
+                        # Vega/MI100: 1:2 ratio
+                        roofline_info[f"{gpu_key} - FP64 Peak"] = f"{fp32_tflops / 2:.2f} TFLOPS (1:2)"
+                    else:
+                        # RDNA or unknown: 1:16 ratio
+                        roofline_info[f"{gpu_key} - FP64 Peak"] = f"{fp32_tflops / 16:.2f} TFLOPS (1:16)"
+
+                    # FP16 Peak (typically 2x FP32)
+                    roofline_info[f"{gpu_key} - FP16 Peak"] = f"{fp32_tflops * 2:.2f} TFLOPS (2x FP32)"
+
+                    # BF16 Peak (for modern architectures)
+                    if gfx_version and any(arch in gfx_version.lower() for arch in ["gfx90a", "gfx940", "gfx941", "gfx942", "gfx1100", "gfx1101"]):
+                        roofline_info[f"{gpu_key} - BF16 Peak"] = f"{fp32_tflops * 2:.2f} TFLOPS (2x FP32)"
+
+                    # INT8 Peak (for CDNA, typically 4x FP32)
+                    if gfx_version and any(arch in gfx_version.lower() for arch in ["gfx90a", "gfx940", "gfx941", "gfx942"]):
+                        roofline_info[f"{gpu_key} - INT8 Peak"] = f"{fp32_tflops * 4:.2f} TOPS (4x FP32)"
+
+                    # FP8 Peak (for CDNA3, typically 8x FP32)
+                    if gfx_version and any(arch in gfx_version.lower() for arch in ["gfx940", "gfx941", "gfx942"]):
+                        roofline_info[f"{gpu_key} - FP8 Peak"] = f"{fp32_tflops * 8:.2f} TFLOPS (8x FP32)"
+
+                    # FP4 Peak (for latest architectures, typically 16x FP32)
+                    if gfx_version and "gfx942" in gfx_version.lower():
+                        roofline_info[f"{gpu_key} - FP4 Peak"] = f"{fp32_tflops * 16:.2f} TFLOPS (16x FP32)"
+
+                    # Memory information
+                    if max_memory:
+                        roofline_info[f"{gpu_key} - Max Memory"] = f"{max_memory:.2f} GB"
+
+                # Reset for next GPU
                 current_gpu = None
-                gpu_formats = OrderedDict()
+                gfx_version = None
+                compute_units = None
+                max_clock_freq = None
+                max_memory = None
 
             elif "Marketing Name" in line and ":" in line:
                 gpu_name = line.split(":", 1)[1].strip()
                 if gpu_name and ("AMD" in gpu_name or "Radeon" in gpu_name or "Instinct" in gpu_name):
                     current_gpu = gpu_name
 
-            elif current_gpu and "target_graphics_version" in line.lower():
-                # Extract GFX version to determine format support
-                if ":" in line:
-                    gfx_version = line.split(":", 1)[1].strip()
-                    gpu_formats["GFX Version"] = gfx_version
+            elif current_gpu and "Compute Unit" in line and ":" in line:
+                try:
+                    compute_units = int(line.split(":", 1)[1].strip())
+                except ValueError:
+                    pass
 
-        # Save last GPU
-        if current_gpu and gpu_formats:
-            formats_info[current_gpu] = f"GFX {gpu_formats.get('GFX Version', 'Unknown')}"
+            elif current_gpu and "Max Clock Freq. (MHz)" in line and ":" in line:
+                try:
+                    max_clock_freq = float(line.split(":", 1)[1].strip())
+                except ValueError:
+                    pass
 
-    # Get GPU-specific format support from amd-smi or rocm-smi
-    amd_smi_static = run_command(["amd-smi", "static", "--json"])
-    if amd_smi_static:
-        try:
-            data = json.loads(amd_smi_static)
-            if isinstance(data, dict):
-                for _, gpu_data in data.items():
-                    if isinstance(gpu_data, dict):
-                        gpu_name = None
-                        gfx_version = None
+            elif current_gpu and "Max Memory (MB)" in line and ":" in line:
+                try:
+                    max_memory_mb = float(line.split(":", 1)[1].strip())
+                    max_memory = max_memory_mb / 1024  # Convert to GB
+                except ValueError:
+                    pass
 
-                        if "asic" in gpu_data and isinstance(gpu_data["asic"], dict):
-                            asic = gpu_data["asic"]
-                            if "market_name" in asic:
-                                gpu_name = asic["market_name"]
-                            if "target_graphics_version" in asic:
-                                gfx_version = asic["target_graphics_version"]
+            elif current_gpu and "Name:" in line and "gfx" in line.lower():
+                # Try to extract GFX version
+                parts = line.split()
+                for part in parts:
+                    if part.lower().startswith("gfx"):
+                        gfx_version = part
+                        break
 
-                        if gpu_name and gfx_version:
-                            # Determine format support based on GFX version
-                            supported_formats = []
+        # Don't forget the last GPU
+        if current_gpu and compute_units:
+            gpu_key = f"{current_gpu}"
+            if gfx_version:
+                gpu_key += f" ({gfx_version})"
 
-                            # All modern AMD GPUs support FP32
-                            supported_formats.append("FP32")
+            ops_per_cu_per_clock = 128
+            base_clock = max_clock_freq if max_clock_freq else 1500
 
-                            # FP64 support (CDNA, some RDNA)
-                            if any(arch in gfx_version.lower() for arch in ["gfx90a", "gfx940", "gfx941", "gfx942"]):
-                                supported_formats.append("FP64 (Full Rate)")
-                            elif any(arch in gfx_version.lower() for arch in ["gfx900", "gfx906", "gfx908"]):
-                                supported_formats.append("FP64 (1/2 Rate)")
+            fp32_tflops = (compute_units * ops_per_cu_per_clock * base_clock) / 1e6
+            roofline_info[f"{gpu_key} - Compute Units"] = str(compute_units)
+            roofline_info[f"{gpu_key} - Max Clock Frequency"] = f"{base_clock:.0f} MHz"
+            roofline_info[f"{gpu_key} - FP32 Peak"] = f"{fp32_tflops:.2f} TFLOPS"
+
+            if gfx_version and any(arch in gfx_version.lower() for arch in ["gfx90a", "gfx940", "gfx941", "gfx942"]):
+                roofline_info[f"{gpu_key} - FP64 Peak"] = f"{fp32_tflops:.2f} TFLOPS (1:1)"
+            elif gfx_version and any(arch in gfx_version.lower() for arch in ["gfx900", "gfx906", "gfx908"]):
+                roofline_info[f"{gpu_key} - FP64 Peak"] = f"{fp32_tflops / 2:.2f} TFLOPS (1:2)"
+            else:
+                roofline_info[f"{gpu_key} - FP64 Peak"] = f"{fp32_tflops / 16:.2f} TFLOPS (1:16)"
+
+            roofline_info[f"{gpu_key} - FP16 Peak"] = f"{fp32_tflops * 2:.2f} TFLOPS (2x FP32)"
+
+            if gfx_version and any(arch in gfx_version.lower() for arch in ["gfx90a", "gfx940", "gfx941", "gfx942", "gfx1100", "gfx1101"]):
+                roofline_info[f"{gpu_key} - BF16 Peak"] = f"{fp32_tflops * 2:.2f} TFLOPS (2x FP32)"
+
+            if gfx_version and any(arch in gfx_version.lower() for arch in ["gfx90a", "gfx940", "gfx941", "gfx942"]):
+                roofline_info[f"{gpu_key} - INT8 Peak"] = f"{fp32_tflops * 4:.2f} TOPS (4x FP32)"
+
+            if gfx_version and any(arch in gfx_version.lower() for arch in ["gfx940", "gfx941", "gfx942"]):
+                roofline_info[f"{gpu_key} - FP8 Peak"] = f"{fp32_tflops * 8:.2f} TFLOPS (8x FP32)"
+
+            if gfx_version and "gfx942" in gfx_version.lower():
+                roofline_info[f"{gpu_key} - FP4 Peak"] = f"{fp32_tflops * 16:.2f} TFLOPS (16x FP32)"
+
+            if max_memory:
+                roofline_info[f"{gpu_key} - Max Memory"] = f"{max_memory:.2f} GB"
+
+    # Add general roofline explanation if no specific data found
+    if len(roofline_info) == 1:
+        roofline_info["Note"] = "Maximum achievable performance based on GPU specifications"
+        roofline_info["Calculation"] = "Peak TFLOPS = Compute Units × Ops/CU/Clock × Clock Frequency"
+        roofline_info["FP32 Ops/CU/Clock"] = "128 (64 stream processors × 2 FMA operations)"
+        roofline_info["Format Ratios"] = "FP16: 2x, INT8: 4x, FP8: 8x, FP4: 16x relative to FP32"
+        roofline_info["FP64 Ratios"] = "CDNA: 1:1, Vega/MI100: 1:2, RDNA: 1:16"
+
+    if len(roofline_info) > 1:
+        microbenchmark_list.append(roofline_info)
+
+    # Add kernel benchmarks (GEMM, memory bandwidth, vector ops, convolution)
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+    kernel_cpp_file = os.path.join(script_dir, "gpu_kernel_benchmarks.cpp")
+    kernel_exe_file = os.path.join(script_dir, "gpu_kernel_benchmarks")
+    
+    if os.path.exists(kernel_cpp_file):
+        if verbose:
+            print(f"Compiling GPU kernel benchmarks: {kernel_cpp_file}")
+        compile_result = run_command(["hipcc", "-O3", "-o", kernel_exe_file, kernel_cpp_file])
+        
+        if compile_result is not None or os.path.exists(kernel_exe_file):
+            if verbose:
+                print(f"Running GPU kernel benchmarks: {kernel_exe_file}")
+            kernel_output = run_command([kernel_exe_file])
+            
+            if kernel_output:
+                try:
+                    json_start = kernel_output.find("{")
+                    if json_start != -1:
+                        json_data = kernel_output[json_start:]
+                        data = json.loads(json_data)
+                        
+                        if "error" in data:
+                            error_info = OrderedDict()
+                            error_info["Section"] = "Kernel Benchmarks - Error"
+                            error_info["Status"] = data["error"]
+                            microbenchmark_list.append(error_info)
+                        elif "results" in data:
+                            for result in data["results"]:
+                                gpu_id = result.get("gpu_id", "?")
+                                gpu_name = result.get("gpu_name", "Unknown")
+                                
+                                benchmark_info = OrderedDict()
+                                benchmark_info["Section"] = f"GPU {gpu_id} Kernel Benchmarks"
+                                benchmark_info["GPU Architecture"] = gpu_name
+                                
+                                if "memory_bandwidth_test" in result:
+                                    bw_test = result["memory_bandwidth_test"]
+                                    benchmark_info["Memory Bandwidth"] = f"{bw_test.get('bandwidth_gbps', 0):.2f} GB/s"
+                                    benchmark_info["Memory Test Size"] = f"{bw_test.get('test_size_mb', 0)} MB"
+                                
+                                if "gemm_fp32_test" in result:
+                                    gemm32 = result["gemm_fp32_test"]
+                                    benchmark_info["GEMM FP32"] = f"{gemm32.get('gflops', 0):.2f} GFLOPS"
+                                    benchmark_info["GEMM FP32 Matrix"] = f"{gemm32.get('matrix_size', 0)}x{gemm32.get('matrix_size', 0)}"
+                                
+                                if "gemm_fp64_test" in result:
+                                    gemm64 = result["gemm_fp64_test"]
+                                    benchmark_info["GEMM FP64"] = f"{gemm64.get('gflops', 0):.2f} GFLOPS"
+                                    benchmark_info["GEMM FP64 Matrix"] = f"{gemm64.get('matrix_size', 0)}x{gemm64.get('matrix_size', 0)}"
+                                
+                                if "vector_add_test" in result:
+                                    vec_add = result["vector_add_test"]
+                                    benchmark_info["Vector Add"] = f"{vec_add.get('gflops', 0):.2f} GFLOPS"
+                                
+                                if "fma_throughput_test" in result:
+                                    fma = result["fma_throughput_test"]
+                                    benchmark_info["FMA Throughput"] = f"{fma.get('tflops', 0):.2f} TFLOPS"
+                                
+                                if "convolution_test" in result:
+                                    conv = result["convolution_test"]
+                                    benchmark_info["1D Convolution"] = f"{conv.get('gflops', 0):.2f} GFLOPS"
+                                    benchmark_info["Conv Kernel Size"] = f"{conv.get('kernel_size', 0)}"
+                                
+                                microbenchmark_list.append(benchmark_info)
+                except json.JSONDecodeError as e:
+                    error_info = OrderedDict()
+                    error_info["Section"] = "Kernel Benchmarks - Error"
+                    error_info["Message"] = f"JSON parsing failed: {str(e)}"
+                    microbenchmark_list.append(error_info)
+
+    # Add GPU-to-GPU communication benchmarks if requested
+    if include_p2p:
+        script_dir = os.path.dirname(os.path.abspath(__file__))
+        cpp_file = os.path.join(script_dir, "gpu_p2p_bandwidth.cpp")
+        exe_file = os.path.join(script_dir, "gpu_p2p_bandwidth")
+
+        # Check if source file exists
+        if not os.path.exists(cpp_file):
+            error_info = OrderedDict()
+            error_info["Section"] = "GPU P2P Communication - Error"
+            error_info["Message"] = f"Source file not found: {cpp_file}"
+            microbenchmark_list.append(error_info)
+        else:
+            # Try to compile the benchmark
+            if verbose:
+                print(f"Compiling GPU P2P benchmark: {cpp_file}")
+            compile_result = run_command(["hipcc", "-o", exe_file, cpp_file])
+
+            if compile_result is None and not os.path.exists(exe_file):
+                error_info = OrderedDict()
+                error_info["Section"] = "GPU P2P Communication - Error"
+                error_info["Message"] = "Failed to compile (hipcc not found or compilation error)"
+                microbenchmark_list.append(error_info)
+            else:
+                # Run the compiled benchmark
+                if verbose:
+                    print(f"Running GPU P2P benchmark: {exe_file}")
+                p2p_output = run_command([exe_file])
+
+                if not p2p_output:
+                    error_info = OrderedDict()
+                    error_info["Section"] = "GPU P2P Communication - Error"
+                    error_info["Message"] = "Benchmark execution failed or produced no output"
+                    microbenchmark_list.append(error_info)
+                else:
+                    try:
+                        # Extract JSON from output
+                        json_start = p2p_output.find("{")
+                        if json_start != -1:
+                            json_data = p2p_output[json_start:]
+                            data = json.loads(json_data)
+
+                            if "error" in data:
+                                error_info = OrderedDict()
+                                error_info["Section"] = "GPU P2P Communication"
+                                error_info["Status"] = data["error"]
+                                microbenchmark_list.append(error_info)
+                            elif "results" in data:
+                                # Add each P2P result as a card
+                                for result in data["results"]:
+                                    p2p_info = OrderedDict()
+                                    src_gpu = result.get("src_gpu", "?")
+                                    dst_gpu = result.get("dst_gpu", "?")
+                                    src_name = result.get("src_name", "Unknown")
+                                    dst_name = result.get("dst_name", "Unknown")
+
+                                    p2p_info["Section"] = f"GPU {src_gpu} → GPU {dst_gpu} Communication"
+                                    p2p_info["Source GPU"] = f"GPU {src_gpu} ({src_name})"
+                                    p2p_info["Destination GPU"] = f"GPU {dst_gpu} ({dst_name})"
+                                    p2p_info["P2P Enabled"] = str(result.get("p2p_enabled", False))
+                                    bandwidth = result.get("bandwidth_gbps", 0.0)
+                                    if bandwidth > 0:
+                                        p2p_info["Bandwidth"] = f"{bandwidth:.2f} GB/s"
+                                    else:
+                                        p2p_info["Bandwidth"] = "Not Available"
+
+                                    microbenchmark_list.append(p2p_info)
                             else:
-                                supported_formats.append("FP64 (1/16 Rate)")
-
-                            # INT8 support (most modern GPUs)
-                            supported_formats.append("INT8")
-
-                            # FP16 support (most modern GPUs)
-                            supported_formats.append("FP16")
-
-                            # BF16 support (newer architectures)
-                            if any(arch in gfx_version.lower() for arch in ["gfx90a", "gfx940", "gfx941", "gfx942", "gfx1100", "gfx1101"]):
-                                supported_formats.append("BF16")
-
-                            # FP8 support (CDNA3 and newer)
-                            if any(arch in gfx_version.lower() for arch in ["gfx940", "gfx941", "gfx942"]):
-                                supported_formats.append("FP8")
-
-                            # FP4 support (limited to specific architectures)
-                            if any(arch in gfx_version.lower() for arch in ["gfx942"]):
-                                supported_formats.append("FP4")
-
-                            formats_info[f"{gpu_name} ({gfx_version})"] = ", ".join(supported_formats)
-        except json.JSONDecodeError:
-            pass
-
-    # If no specific GPU data found, provide general format information
-    if len(formats_info) == 1:
-        formats_info["FP32"] = "32-bit floating-point (standard precision)"
-        formats_info["FP64"] = "64-bit floating-point (double precision)"
-        formats_info["FP16"] = "16-bit floating-point (half precision)"
-        formats_info["BF16"] = "16-bit brain floating-point"
-        formats_info["INT8"] = "8-bit integer (quantized operations)"
-        formats_info["FP8"] = "8-bit floating-point (AI/ML workloads)"
-        formats_info["FP4"] = "4-bit floating-point (extreme quantization)"
-
-    if len(formats_info) > 1:
-        microbenchmark_list.append(formats_info)
+                                error_info = OrderedDict()
+                                error_info["Section"] = "GPU P2P Communication - Error"
+                                error_info["Message"] = "Invalid JSON format - no results found"
+                                microbenchmark_list.append(error_info)
+                    except json.JSONDecodeError as e:
+                        error_info = OrderedDict()
+                        error_info["Section"] = "GPU P2P Communication - Error"
+                        error_info["Message"] = f"JSON parsing failed: {str(e)}"
+                        error_info["Raw Output"] = p2p_output[:500]  # First 500 chars
+                        microbenchmark_list.append(error_info)
 
     if microbenchmark_list:
         details["linux"] = microbenchmark_list
@@ -1023,14 +2037,168 @@ def gather_rocm_details() -> Dict[str, List[Dict[str, str]]]:
 
     return details
 
-def main() -> None:
-    cpu_details = gather_cpu_details()
-    gpu_details = gather_gpu_details()
-    network_details = gather_network_details()
-    rocm_details = gather_rocm_details()
-    microbenchmark_details = gather_gpu_microbenchmarks()
+def _parse_args() -> argparse.Namespace:
+    """Parse command-line arguments."""
+    parser = argparse.ArgumentParser(
+        description="AMD Rapido - Collect server hardware information (CPU, GPU, Network, ROCm)"
+    )
+    parser.add_argument(
+        "-c",
+        "--cpu",
+        action="store_true",
+        help="Collect CPU information only",
+    )
+    parser.add_argument(
+        "-g",
+        "--gpu",
+        action="store_true",
+        help="Collect GPU information only",
+    )
+    parser.add_argument(
+        "-n",
+        "--network",
+        action="store_true",
+        help="Collect network information only",
+    )
+    parser.add_argument(
+        "-b",
+        "--bmc",
+        action="store_true",
+        help="Collect BMC information only",
+    )
+    parser.add_argument(
+        "-r",
+        "--rocm",
+        action="store_true",
+        help="Collect ROCm information only",
+    )
+    parser.add_argument(
+        "-m",
+        "--microbenchmarks",
+        action="store_true",
+        help="Collect GPU microbenchmarks only (automatically includes ROCm info)",
+    )
+    parser.add_argument(
+        "-a",
+        "--all",
+        action="store_true",
+        help="Collect all information (default if no specific flags are provided)",
+    )
+    parser.add_argument(
+        "-p",
+        "--p2p",
+        action="store_true",
+        help="Include GPU-to-GPU peer-to-peer communication bandwidth tests (requires -m flag)",
+    )
+    parser.add_argument(
+        "-v",
+        "--verbose",
+        action="store_true",
+        help="Enable verbose output (show tool availability check and progress messages)",
+    )
+    return parser.parse_args()
 
+def main() -> None:
+    args = _parse_args()
+
+    # Determine which sections to collect
+    # If no specific flags are provided, or -a is used, collect all
+    collect_all = args.all or not (args.cpu or args.gpu or args.network or args.bmc or args.rocm or args.microbenchmarks)
+    
+    collect_cpu = collect_all or args.cpu
+    collect_gpu = collect_all or args.gpu
+    collect_network = collect_all or args.network
+    collect_bmc = collect_all or args.bmc
+    collect_rocm = collect_all or args.rocm or args.microbenchmarks  # ROCm is collected with microbenchmarks
+    collect_microbenchmarks = collect_all or args.microbenchmarks
+
+    # Check and report tool availability at the beginning
+    check_tool_availability(verbose=args.verbose)
+
+    # Warn if -p is used without -m
+    if args.p2p and not collect_microbenchmarks:
+        if args.verbose:
+            print("Warning: -p/--p2p flag requires -m/--microbenchmarks flag to be effective")
+            print("GPU P2P communication tests will be skipped. Use: python rapido-collect.py -m -p")
+    
+    if args.verbose:
+        print("Starting data collection...")
+        print()
+
+    # Collect data based on flags with error handling
+    cpu_details = {}
+    gpu_details = {}
+    network_details = {}
+    bmc_details = {}
+    rocm_details = {}
+    microbenchmark_details = {}
+    collection_errors = []
+    
+    try:
+        if collect_cpu:
+            try:
+                cpu_details = gather_cpu_details()
+            except Exception as e:
+                collection_errors.append(f"CPU collection failed: {str(e)}")
+                if args.verbose:
+                    print(f"Warning: CPU collection failed: {str(e)}")
+        
+        if collect_gpu:
+            try:
+                gpu_details = gather_gpu_details()
+            except Exception as e:
+                collection_errors.append(f"GPU collection failed: {str(e)}")
+                if args.verbose:
+                    print(f"Warning: GPU collection failed: {str(e)}")
+        
+        if collect_network:
+            try:
+                network_details = gather_network_details()
+            except Exception as e:
+                collection_errors.append(f"Network collection failed: {str(e)}")
+                if args.verbose:
+                    print(f"Warning: Network collection failed: {str(e)}")
+        
+        if collect_bmc:
+            try:
+                bmc_details = gather_bmc_info()
+            except Exception as e:
+                collection_errors.append(f"BMC collection failed: {str(e)}")
+                if args.verbose:
+                    print(f"Warning: BMC collection failed: {str(e)}")
+        
+        if collect_rocm:
+            try:
+                rocm_details = gather_rocm_details()
+            except Exception as e:
+                collection_errors.append(f"ROCm collection failed: {str(e)}")
+                if args.verbose:
+                    print(f"Warning: ROCm collection failed: {str(e)}")
+        
+        if collect_microbenchmarks:
+            try:
+                microbenchmark_details = gather_gpu_microbenchmarks(include_p2p=args.p2p, verbose=args.verbose)
+            except Exception as e:
+                collection_errors.append(f"Microbenchmark collection failed: {str(e)}")
+                if args.verbose:
+                    print(f"Warning: Microbenchmark collection failed: {str(e)}")
+    
+    except KeyboardInterrupt:
+        print("\n\nData collection interrupted by user (Ctrl+C)")
+        print("Saving partial data collected so far...")
+        collection_errors.append("Collection interrupted by user")
+
+    # Build payload with metadata
     payload = OrderedDict()
+    
+    # Add collection metadata
+    import datetime
+    payload["_metadata"] = {
+        "collection_date": datetime.datetime.now().isoformat(),
+        "collection_status": "partial" if collection_errors else "complete",
+        "errors": collection_errors if collection_errors else []
+    }
+    
     payload["cpu"] = cpu_details
     if gpu_details:
         payload["gpu"] = gpu_details
@@ -1040,6 +2208,10 @@ def main() -> None:
         payload["network"] = network_details
     else:
         payload["network"] = []
+    if bmc_details:
+        payload["bmc"] = bmc_details
+    else:
+        payload["bmc"] = []
     if rocm_details:
         payload["rocm"] = rocm_details
     else:
@@ -1058,10 +2230,34 @@ def main() -> None:
     except Exception:
         filename = "serverinfo.json"
 
-    with open(filename, "w", encoding="utf-8") as json_file:
-        json.dump(payload, json_file, indent=2)
-
-    print(f"Server information saved to: {filename}")
+    # Write JSON with error handling to ensure file is always complete
+    try:
+        with open(filename, "w", encoding="utf-8") as json_file:
+            json.dump(payload, json_file, indent=2)
+        
+        # Validate the written JSON
+        try:
+            with open(filename, "r", encoding="utf-8") as json_file:
+                json.load(json_file)
+        except json.JSONDecodeError as e:
+            print(f"\nWARNING: Generated JSON file may be corrupted!")
+            print(f"Validation error: {e.msg} at line {e.lineno}")
+            print(f"The file was written but may not be readable.")
+            return
+        
+        print(f"Server information saved to: {filename}")
+        
+        if collection_errors:
+            print(f"\nNote: Collection completed with {len(collection_errors)} error(s):")
+            for error in collection_errors:
+                print(f"  - {error}")
+            print(f"\nPartial data has been saved. Re-run collection to get complete data.")
+    
+    except Exception as e:
+        print(f"\nERROR: Failed to write JSON file: {filename}")
+        print(f"Reason: {str(e)}")
+        print(f"Data collection completed but could not be saved.")
+        raise SystemExit(1)
 
 if __name__ == "__main__":
     main()
