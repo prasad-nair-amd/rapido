@@ -127,7 +127,7 @@ def check_tool_availability(verbose: bool = True) -> None:
                     result = run_command(["which", tool_cmd])
             
             if verbose:
-                status = "✓" if result is not None else "✗"
+                status = "[+]" if result is not None else "[x]"
                 status_text = "AVAILABLE" if result is not None else "MISSING"
                 print(f"  {status} {tool_name:30} [{status_text:9}]  ({tool_cmd})")
             
@@ -148,21 +148,33 @@ def check_tool_availability(verbose: bool = True) -> None:
         
         p2p_cpp = os.path.join(script_dir, "gpu_p2p_bandwidth.cpp")
         kernel_cpp = os.path.join(script_dir, "gpu_kernel_benchmarks.cpp")
+        host_cpp = os.path.join(script_dir, "gpu_host_bandwidth.cpp")
+        topology_cpp = os.path.join(script_dir, "gpu_topology.cpp")
         
         p2p_exists = os.path.exists(p2p_cpp)
         kernel_exists = os.path.exists(kernel_cpp)
+        host_exists = os.path.exists(host_cpp)
+        topology_exists = os.path.exists(topology_cpp)
         
-        print(f"  {'✓' if p2p_exists else '✗'} GPU P2P Benchmark Source    [{'FOUND' if p2p_exists else 'MISSING'}]")
+        print(f"  {'[+]' if p2p_exists else '[x]'} GPU P2P Benchmark Source    [{'FOUND' if p2p_exists else 'MISSING'}]")
         if not p2p_exists:
             print(f"    Impact: P2P bandwidth tests will be skipped (requires -p flag)")
         
-        print(f"  {'✓' if kernel_exists else '✗'} Kernel Benchmark Source     [{'FOUND' if kernel_exists else 'MISSING'}]")
+        print(f"  {'[+]' if kernel_exists else '[x]'} Kernel Benchmark Source     [{'FOUND' if kernel_exists else 'MISSING'}]")
         if not kernel_exists:
             print(f"    Impact: Kernel benchmarks will be skipped (requires -m flag)")
         
+        print(f"  {'[+]' if host_exists else '[x]'} GPU-CPU Bandwidth Source    [{'FOUND' if host_exists else 'MISSING'}]")
+        if not host_exists:
+            print(f"    Impact: GPU-CPU transfer bandwidth tests will be skipped (requires -p flag)")
+        
+        print(f"  {'[+]' if topology_exists else '[x]'} GPU Topology Source        [{'FOUND' if topology_exists else 'MISSING'}]")
+        if not topology_exists:
+            print(f"    Impact: XGMI/Infinity Fabric topology analysis will be skipped (requires -p flag)")
+        
         # Check ROCm installation
         rocm_path_exists = os.path.exists("/opt/rocm")
-        print(f"  {'✓' if rocm_path_exists else '✗'} ROCm Installation         [{'FOUND' if rocm_path_exists else 'MISSING'}]")
+        print(f"  {'[+]' if rocm_path_exists else '[x]'} ROCm Installation         [{'FOUND' if rocm_path_exists else 'MISSING'}]")
         if not rocm_path_exists:
             print(f"    Impact: ROCm section and GPU benchmarks will be incomplete")
     
@@ -192,7 +204,7 @@ def check_tool_availability(verbose: bool = True) -> None:
                 for impact in impacts:
                     print(impact)
         else:
-            print("✓ All tools are available! Full functionality enabled.")
+            print("[+] All tools are available! Full functionality enabled.")
         
         print()
         print("=" * 80)
@@ -1522,10 +1534,6 @@ def gather_gpu_microbenchmarks(include_p2p: bool = False, verbose: bool = True) 
 
     microbenchmark_list = []
 
-    # Peak Performance Benchmarks
-    roofline_info = OrderedDict()
-    roofline_info["Section"] = "Peak Performance"
-
     # Get GPU specifications for roofline calculations from rocminfo
     rocminfo_output = run_command(["rocminfo"])
     if rocminfo_output:
@@ -1552,45 +1560,97 @@ def gather_gpu_microbenchmarks(include_p2p: bool = False, verbose: bool = True) 
                     # Use detected or estimated clock frequency
                     base_clock = max_clock_freq if max_clock_freq else 1500  # Default 1.5 GHz if not detected
 
-                    # Calculate FP32 peak performance
-                    fp32_tflops = (compute_units * ops_per_cu_per_clock * base_clock) / 1e6
-                    roofline_info[f"{gpu_key} - Compute Units"] = str(compute_units)
-                    roofline_info[f"{gpu_key} - Max Clock Frequency"] = f"{base_clock:.0f} MHz"
-                    roofline_info[f"{gpu_key} - FP32 Peak"] = f"{fp32_tflops:.2f} TFLOPS"
+                    # Calculate FP32 peak performance (dense)
+                    fp32_dense_tflops = (compute_units * ops_per_cu_per_clock * base_clock) / 1e6
+                    
+                    # Sparse performance is typically 2x dense for certain architectures
+                    fp32_sparse_tflops = fp32_dense_tflops * 2 if gfx_version and any(arch in gfx_version.lower() for arch in ["gfx90a", "gfx940", "gfx941", "gfx942"]) else fp32_dense_tflops
 
-                    # FP64 Peak (architecture-dependent ratio)
+                    # Create separate cards for Dense and Sparse calculations
+                    
+                    # DENSE CALCULATIONS
+                    dense_info = OrderedDict()
+                    dense_info["Section"] = f"{gpu_key} - Dense Peak Performance"
+                    dense_info["Compute Units"] = str(compute_units)
+                    dense_info["Max Clock Frequency"] = f"{base_clock:.0f} MHz"
+                    
+                    # FP64 (double precision)
                     if gfx_version and any(arch in gfx_version.lower() for arch in ["gfx90a", "gfx940", "gfx941", "gfx942"]):
-                        # CDNA: 1:1 ratio
-                        roofline_info[f"{gpu_key} - FP64 Peak"] = f"{fp32_tflops:.2f} TFLOPS (1:1)"
+                        fp64_dense = fp32_dense_tflops
+                        dense_info["FP64 (double precision)"] = f"{fp64_dense:.1f} TFLOPS"
                     elif gfx_version and any(arch in gfx_version.lower() for arch in ["gfx900", "gfx906", "gfx908"]):
-                        # Vega/MI100: 1:2 ratio
-                        roofline_info[f"{gpu_key} - FP64 Peak"] = f"{fp32_tflops / 2:.2f} TFLOPS (1:2)"
+                        fp64_dense = fp32_dense_tflops / 2
+                        dense_info["FP64 (double precision)"] = f"{fp64_dense:.1f} TFLOPS"
                     else:
-                        # RDNA or unknown: 1:16 ratio
-                        roofline_info[f"{gpu_key} - FP64 Peak"] = f"{fp32_tflops / 16:.2f} TFLOPS (1:16)"
-
-                    # FP16 Peak (typically 2x FP32)
-                    roofline_info[f"{gpu_key} - FP16 Peak"] = f"{fp32_tflops * 2:.2f} TFLOPS (2x FP32)"
-
-                    # BF16 Peak (for modern architectures)
-                    if gfx_version and any(arch in gfx_version.lower() for arch in ["gfx90a", "gfx940", "gfx941", "gfx942", "gfx1100", "gfx1101"]):
-                        roofline_info[f"{gpu_key} - BF16 Peak"] = f"{fp32_tflops * 2:.2f} TFLOPS (2x FP32)"
-
-                    # INT8 Peak (for CDNA, typically 4x FP32)
+                        fp64_dense = fp32_dense_tflops / 16
+                        dense_info["FP64 (double precision)"] = f"{fp64_dense:.1f} TFLOPS"
+                    
+                    # FP32 (single precision)
+                    dense_info["FP32 (single precision)"] = f"{fp32_dense_tflops:.1f} TFLOPS (matrix and vector)"
+                    
+                    # TF32 (TensorFloat-32) - 4x FP32 for CDNA2+
+                    tf32_dense = fp32_dense_tflops * 4
                     if gfx_version and any(arch in gfx_version.lower() for arch in ["gfx90a", "gfx940", "gfx941", "gfx942"]):
-                        roofline_info[f"{gpu_key} - INT8 Peak"] = f"{fp32_tflops * 4:.2f} TOPS (4x FP32)"
-
-                    # FP8 Peak (for CDNA3, typically 8x FP32)
+                        dense_info["TF32 (TensorFloat-32)"] = f"{tf32_dense:.1f} TFLOPS"
+                    
+                    # FP16 / BF16
+                    fp16_dense = fp32_dense_tflops * 2
+                    if gfx_version and any(arch in gfx_version.lower() for arch in ["gfx90a", "gfx940", "gfx941", "gfx942", "gfx1100", "gfx1101"]):
+                        dense_info["FP16 / BF16"] = f"{fp16_dense:.1f} TFLOPS"
+                    else:
+                        dense_info["FP16"] = f"{fp16_dense:.1f} TFLOPS"
+                    
+                    # FP8
+                    fp8_dense = fp32_dense_tflops * 8
                     if gfx_version and any(arch in gfx_version.lower() for arch in ["gfx940", "gfx941", "gfx942"]):
-                        roofline_info[f"{gpu_key} - FP8 Peak"] = f"{fp32_tflops * 8:.2f} TFLOPS (8x FP32)"
-
-                    # FP4 Peak (for latest architectures, typically 16x FP32)
-                    if gfx_version and "gfx942" in gfx_version.lower():
-                        roofline_info[f"{gpu_key} - FP4 Peak"] = f"{fp32_tflops * 16:.2f} TFLOPS (16x FP32)"
-
-                    # Memory information
+                        dense_info["FP8"] = f"{fp8_dense:.1f} TFLOPS"
+                    
+                    # INT8
+                    int8_dense = fp32_dense_tflops * 4
+                    if gfx_version and any(arch in gfx_version.lower() for arch in ["gfx90a", "gfx940", "gfx941", "gfx942"]):
+                        dense_info["INT8"] = f"{int8_dense:.1f} TOPS"
+                    
                     if max_memory:
-                        roofline_info[f"{gpu_key} - Max Memory"] = f"{max_memory:.2f} GB"
+                        dense_info["Max Memory"] = f"{max_memory:.2f} GB"
+                    
+                    microbenchmark_list.append(dense_info)
+                    
+                    # SPARSE CALCULATIONS (only for supported architectures)
+                    if gfx_version and any(arch in gfx_version.lower() for arch in ["gfx90a", "gfx940", "gfx941", "gfx942"]):
+                        sparse_info = OrderedDict()
+                        sparse_info["Section"] = f"{gpu_key} - Sparse Peak Performance"
+                        sparse_info["Compute Units"] = str(compute_units)
+                        sparse_info["Max Clock Frequency"] = f"{base_clock:.0f} MHz"
+                        sparse_info["Note"] = "2:1 sparse matrix operations (50% sparsity)"
+                        
+                        # FP64 sparse
+                        fp64_sparse = fp64_dense * 2
+                        sparse_info["FP64 (double precision)"] = f"{fp64_sparse:.1f} TFLOPS"
+                        
+                        # FP32 sparse
+                        sparse_info["FP32 (single precision)"] = f"{fp32_sparse_tflops:.1f} TFLOPS (matrix and vector)"
+                        
+                        # TF32 sparse
+                        tf32_sparse = tf32_dense * 2
+                        sparse_info["TF32 (TensorFloat-32)"] = f"{tf32_sparse:.1f} TFLOPS"
+                        
+                        # FP16 / BF16 sparse
+                        fp16_sparse = fp16_dense * 2
+                        sparse_info["FP16 / BF16"] = f"{fp16_sparse:.1f} TFLOPS"
+                        
+                        # FP8 sparse
+                        if gfx_version and any(arch in gfx_version.lower() for arch in ["gfx940", "gfx941", "gfx942"]):
+                            fp8_sparse = fp8_dense * 2
+                            # FP8 range for sparse
+                            fp8_min = fp8_dense
+                            fp8_max = fp8_sparse
+                            sparse_info["FP8"] = f"{fp8_min:.1f}–{fp8_max:.1f} TFLOPS"
+                        
+                        # INT8 sparse
+                        int8_sparse = int8_dense * 2
+                        sparse_info["INT8"] = f"{int8_sparse:.1f} TOPS"
+                        
+                        microbenchmark_list.append(sparse_info)
 
                 # Reset for next GPU
                 current_gpu = None
@@ -1640,45 +1700,95 @@ def gather_gpu_microbenchmarks(include_p2p: bool = False, verbose: bool = True) 
             ops_per_cu_per_clock = 128
             base_clock = max_clock_freq if max_clock_freq else 1500
 
-            fp32_tflops = (compute_units * ops_per_cu_per_clock * base_clock) / 1e6
-            roofline_info[f"{gpu_key} - Compute Units"] = str(compute_units)
-            roofline_info[f"{gpu_key} - Max Clock Frequency"] = f"{base_clock:.0f} MHz"
-            roofline_info[f"{gpu_key} - FP32 Peak"] = f"{fp32_tflops:.2f} TFLOPS"
+            # Calculate FP32 peak performance (dense)
+            fp32_dense_tflops = (compute_units * ops_per_cu_per_clock * base_clock) / 1e6
+            
+            # Sparse performance is typically 2x dense for certain architectures
+            fp32_sparse_tflops = fp32_dense_tflops * 2 if gfx_version and any(arch in gfx_version.lower() for arch in ["gfx90a", "gfx940", "gfx941", "gfx942"]) else fp32_dense_tflops
 
+            # DENSE CALCULATIONS
+            dense_info = OrderedDict()
+            dense_info["Section"] = f"{gpu_key} - Dense Peak Performance"
+            dense_info["Compute Units"] = str(compute_units)
+            dense_info["Max Clock Frequency"] = f"{base_clock:.0f} MHz"
+            
+            # FP64 (double precision)
             if gfx_version and any(arch in gfx_version.lower() for arch in ["gfx90a", "gfx940", "gfx941", "gfx942"]):
-                roofline_info[f"{gpu_key} - FP64 Peak"] = f"{fp32_tflops:.2f} TFLOPS (1:1)"
+                fp64_dense = fp32_dense_tflops
+                dense_info["FP64 (double precision)"] = f"{fp64_dense:.1f} TFLOPS"
             elif gfx_version and any(arch in gfx_version.lower() for arch in ["gfx900", "gfx906", "gfx908"]):
-                roofline_info[f"{gpu_key} - FP64 Peak"] = f"{fp32_tflops / 2:.2f} TFLOPS (1:2)"
+                fp64_dense = fp32_dense_tflops / 2
+                dense_info["FP64 (double precision)"] = f"{fp64_dense:.1f} TFLOPS"
             else:
-                roofline_info[f"{gpu_key} - FP64 Peak"] = f"{fp32_tflops / 16:.2f} TFLOPS (1:16)"
-
-            roofline_info[f"{gpu_key} - FP16 Peak"] = f"{fp32_tflops * 2:.2f} TFLOPS (2x FP32)"
-
-            if gfx_version and any(arch in gfx_version.lower() for arch in ["gfx90a", "gfx940", "gfx941", "gfx942", "gfx1100", "gfx1101"]):
-                roofline_info[f"{gpu_key} - BF16 Peak"] = f"{fp32_tflops * 2:.2f} TFLOPS (2x FP32)"
-
+                fp64_dense = fp32_dense_tflops / 16
+                dense_info["FP64 (double precision)"] = f"{fp64_dense:.1f} TFLOPS"
+            
+            # FP32 (single precision)
+            dense_info["FP32 (single precision)"] = f"{fp32_dense_tflops:.1f} TFLOPS (matrix and vector)"
+            
+            # TF32 (TensorFloat-32) - 4x FP32 for CDNA2+
+            tf32_dense = fp32_dense_tflops * 4
             if gfx_version and any(arch in gfx_version.lower() for arch in ["gfx90a", "gfx940", "gfx941", "gfx942"]):
-                roofline_info[f"{gpu_key} - INT8 Peak"] = f"{fp32_tflops * 4:.2f} TOPS (4x FP32)"
-
+                dense_info["TF32 (TensorFloat-32)"] = f"{tf32_dense:.1f} TFLOPS"
+            
+            # FP16 / BF16
+            fp16_dense = fp32_dense_tflops * 2
+            if gfx_version and any(arch in gfx_version.lower() for arch in ["gfx90a", "gfx940", "gfx941", "gfx942", "gfx1100", "gfx1101"]):
+                dense_info["FP16 / BF16"] = f"{fp16_dense:.1f} TFLOPS"
+            else:
+                dense_info["FP16"] = f"{fp16_dense:.1f} TFLOPS"
+            
+            # FP8
+            fp8_dense = fp32_dense_tflops * 8
             if gfx_version and any(arch in gfx_version.lower() for arch in ["gfx940", "gfx941", "gfx942"]):
-                roofline_info[f"{gpu_key} - FP8 Peak"] = f"{fp32_tflops * 8:.2f} TFLOPS (8x FP32)"
-
-            if gfx_version and "gfx942" in gfx_version.lower():
-                roofline_info[f"{gpu_key} - FP4 Peak"] = f"{fp32_tflops * 16:.2f} TFLOPS (16x FP32)"
-
+                dense_info["FP8"] = f"{fp8_dense:.1f} TFLOPS"
+            
+            # INT8
+            int8_dense = fp32_dense_tflops * 4
+            if gfx_version and any(arch in gfx_version.lower() for arch in ["gfx90a", "gfx940", "gfx941", "gfx942"]):
+                dense_info["INT8"] = f"{int8_dense:.1f} TOPS"
+            
             if max_memory:
-                roofline_info[f"{gpu_key} - Max Memory"] = f"{max_memory:.2f} GB"
-
-    # Add general roofline explanation if no specific data found
-    if len(roofline_info) == 1:
-        roofline_info["Note"] = "Maximum achievable performance based on GPU specifications"
-        roofline_info["Calculation"] = "Peak TFLOPS = Compute Units × Ops/CU/Clock × Clock Frequency"
-        roofline_info["FP32 Ops/CU/Clock"] = "128 (64 stream processors × 2 FMA operations)"
-        roofline_info["Format Ratios"] = "FP16: 2x, INT8: 4x, FP8: 8x, FP4: 16x relative to FP32"
-        roofline_info["FP64 Ratios"] = "CDNA: 1:1, Vega/MI100: 1:2, RDNA: 1:16"
-
-    if len(roofline_info) > 1:
-        microbenchmark_list.append(roofline_info)
+                dense_info["Max Memory"] = f"{max_memory:.2f} GB"
+            
+            microbenchmark_list.append(dense_info)
+            
+            # SPARSE CALCULATIONS (only for supported architectures)
+            if gfx_version and any(arch in gfx_version.lower() for arch in ["gfx90a", "gfx940", "gfx941", "gfx942"]):
+                sparse_info = OrderedDict()
+                sparse_info["Section"] = f"{gpu_key} - Sparse Peak Performance"
+                sparse_info["Compute Units"] = str(compute_units)
+                sparse_info["Max Clock Frequency"] = f"{base_clock:.0f} MHz"
+                sparse_info["Note"] = "2:1 sparse matrix operations (50% sparsity)"
+                
+                # FP64 sparse
+                fp64_sparse = fp64_dense * 2
+                sparse_info["FP64 (double precision)"] = f"{fp64_sparse:.1f} TFLOPS"
+                
+                # FP32 sparse
+                sparse_info["FP32 (single precision)"] = f"{fp32_sparse_tflops:.1f} TFLOPS (matrix and vector)"
+                
+                # TF32 sparse
+                tf32_sparse = tf32_dense * 2
+                sparse_info["TF32 (TensorFloat-32)"] = f"{tf32_sparse:.1f} TFLOPS"
+                
+                # FP16 / BF16 sparse
+                fp16_sparse = fp16_dense * 2
+                sparse_info["FP16 / BF16"] = f"{fp16_sparse:.1f} TFLOPS"
+                
+                # FP8 sparse
+                if gfx_version and any(arch in gfx_version.lower() for arch in ["gfx940", "gfx941", "gfx942"]):
+                    fp8_sparse = fp8_dense * 2
+                    # FP8 range for sparse
+                    fp8_min = fp8_dense
+                    fp8_max = fp8_sparse
+                    sparse_info["FP8"] = f"{fp8_min:.1f}–{fp8_max:.1f} TFLOPS"
+                
+                # INT8 sparse
+                int8_sparse = int8_dense * 2
+                sparse_info["INT8"] = f"{int8_sparse:.1f} TOPS"
+                
+                microbenchmark_list.append(sparse_info)
 
     # Add kernel benchmarks (GEMM, memory bandwidth, vector ops, convolution)
     script_dir = os.path.dirname(os.path.abspath(__file__))
@@ -1829,6 +1939,323 @@ def gather_gpu_microbenchmarks(include_p2p: bool = False, verbose: bool = True) 
                         error_info["Message"] = f"JSON parsing failed: {str(e)}"
                         error_info["Raw Output"] = p2p_output[:500]  # First 500 chars
                         microbenchmark_list.append(error_info)
+
+        # Add GPU-CPU (Host) bandwidth benchmarks
+        host_cpp_file = os.path.join(script_dir, "gpu_host_bandwidth.cpp")
+        host_exe_file = os.path.join(script_dir, "gpu_host_bandwidth")
+
+        if os.path.exists(host_cpp_file):
+            if verbose:
+                print(f"Compiling GPU-CPU bandwidth benchmark: {host_cpp_file}")
+            compile_result = run_command(["hipcc", "-o", host_exe_file, host_cpp_file])
+
+            if compile_result is not None or os.path.exists(host_exe_file):
+                if verbose:
+                    print(f"Running GPU-CPU bandwidth benchmark: {host_exe_file}")
+                host_output = run_command([host_exe_file])
+
+                if host_output:
+                    try:
+                        json_start = host_output.find("{")
+                        if json_start != -1:
+                            json_data = host_output[json_start:]
+                            data = json.loads(json_data)
+
+                            if "error" in data:
+                                error_info = OrderedDict()
+                                error_info["Section"] = "GPU-CPU Transfer Bandwidth - Error"
+                                error_info["Status"] = data["error"]
+                                microbenchmark_list.append(error_info)
+                            elif "results" in data:
+                                for result in data["results"]:
+                                    gpu_id = result.get("gpu", "?")
+                                    gpu_name = result.get("gpu_name", "Unknown")
+
+                                    host_bw_info = OrderedDict()
+                                    host_bw_info["Section"] = f"GPU {gpu_id} Host Transfer Bandwidth"
+                                    host_bw_info["GPU Architecture"] = gpu_name
+                                    host_bw_info["Host→Device (Pageable)"] = f"{result.get('h2d_pageable_gbps', 0):.2f} GB/s"
+                                    host_bw_info["Device→Host (Pageable)"] = f"{result.get('d2h_pageable_gbps', 0):.2f} GB/s"
+                                    host_bw_info["Host→Device (Pinned)"] = f"{result.get('h2d_pinned_gbps', 0):.2f} GB/s"
+                                    host_bw_info["Device→Host (Pinned)"] = f"{result.get('d2h_pinned_gbps', 0):.2f} GB/s"
+
+                                    microbenchmark_list.append(host_bw_info)
+                    except json.JSONDecodeError as e:
+                        error_info = OrderedDict()
+                        error_info["Section"] = "GPU-CPU Transfer Bandwidth - Error"
+                        error_info["Message"] = f"JSON parsing failed: {str(e)}"
+                        microbenchmark_list.append(error_info)
+
+        # Add GPU topology analysis (XGMI/Infinity Fabric)
+        topology_cpp_file = os.path.join(script_dir, "gpu_topology.cpp")
+        topology_exe_file = os.path.join(script_dir, "gpu_topology")
+
+        if os.path.exists(topology_cpp_file):
+            if verbose:
+                print(f"Compiling GPU topology analysis: {topology_cpp_file}")
+            compile_result = run_command(["hipcc", "-o", topology_exe_file, topology_cpp_file])
+
+            if compile_result is not None or os.path.exists(topology_exe_file):
+                if verbose:
+                    print(f"Running GPU topology analysis: {topology_exe_file}")
+                topology_output = run_command([topology_exe_file])
+
+                if topology_output:
+                    try:
+                        json_start = topology_output.find("{")
+                        if json_start != -1:
+                            json_data = topology_output[json_start:]
+                            data = json.loads(json_data)
+
+                            if "error" in data:
+                                error_info = OrderedDict()
+                                error_info["Section"] = "GPU Topology (XGMI/Infinity Fabric) - Error"
+                                error_info["Status"] = data["error"]
+                                microbenchmark_list.append(error_info)
+                            elif "bandwidth_matrix" in data:
+                                # Add topology summary
+                                topo_summary = OrderedDict()
+                                topo_summary["Section"] = "GPU Topology Summary"
+                                topo_summary["GPU Count"] = str(data.get("gpu_count", 0))
+                                
+                                # Count link types
+                                xgmi_links = 0
+                                pcie_links = 0
+                                no_p2p_links = 0
+                                
+                                for row in data["bandwidth_matrix"]:
+                                    for link in row:
+                                        link_type = link.get("link_type", "")
+                                        if "XGMI" in link_type and link_type != "Self":
+                                            xgmi_links += 1
+                                        elif link_type == "PCIe":
+                                            pcie_links += 1
+                                        elif link_type == "No P2P":
+                                            no_p2p_links += 1
+                                
+                                topo_summary["XGMI Links"] = str(xgmi_links)
+                                topo_summary["PCIe Links"] = str(pcie_links)
+                                if no_p2p_links > 0:
+                                    topo_summary["No P2P Links"] = str(no_p2p_links)
+                                
+                                microbenchmark_list.append(topo_summary)
+                                
+                                # Add detailed bandwidth matrix for each GPU
+                                for i, row in enumerate(data["bandwidth_matrix"]):
+                                    gpu_info = OrderedDict()
+                                    gpu_name = "Unknown"
+                                    
+                                    # Get GPU name from gpus list
+                                    if "gpus" in data and i < len(data["gpus"]):
+                                        gpu_name = data["gpus"][i].get("name", "Unknown")
+                                    
+                                    gpu_info["Section"] = f"GPU {i} Topology Links"
+                                    gpu_info["GPU Architecture"] = gpu_name
+                                    
+                                    for link in row:
+                                        dst = link.get("dst", "?")
+                                        if dst != i:  # Skip self-links
+                                            link_type = link.get("link_type", "Unknown")
+                                            bandwidth = link.get("bandwidth_gbps", 0.0)
+                                            hops = link.get("hops", -1)
+                                            
+                                            link_desc = f"{link_type}"
+                                            if hops > 0:
+                                                link_desc += f" ({hops} hops)"
+                                            if bandwidth > 0:
+                                                link_desc += f" - {bandwidth:.2f} GB/s"
+                                            
+                                            gpu_info[f"→ GPU {dst}"] = link_desc
+                                    
+                                    if len(gpu_info) > 2:  # Only add if there are actual links
+                                        microbenchmark_list.append(gpu_info)
+                                        
+                    except json.JSONDecodeError as e:
+                        error_info = OrderedDict()
+                        error_info["Section"] = "GPU Topology (XGMI/Infinity Fabric) - Error"
+                        error_info["Message"] = f"JSON parsing failed: {str(e)}"
+                        microbenchmark_list.append(error_info)
+
+        # Add Storage I/O Profiling
+        storage_py_file = os.path.join(script_dir, "storage_benchmark.py")
+        
+        if os.path.exists(storage_py_file):
+            if verbose:
+                print(f"Running storage I/O profiling: {storage_py_file}")
+            storage_output = run_command(["python3", storage_py_file])
+            
+            if storage_output:
+                try:
+                    # Find JSON in output
+                    json_start = storage_output.find("{")
+                    if json_start != -1:
+                        json_data = storage_output[json_start:]
+                        data = json.loads(json_data)
+                        
+                        # Storage Devices Summary
+                        if data.get("storage_devices"):
+                            storage_summary = OrderedDict()
+                            storage_summary["Section"] = "Storage Devices Detected"
+                            
+                            ssd_count = sum(1 for d in data["storage_devices"] if not d.get("rotational"))
+                            hdd_count = sum(1 for d in data["storage_devices"] if d.get("rotational"))
+                            
+                            storage_summary["Total Devices"] = str(len(data["storage_devices"]))
+                            if ssd_count > 0:
+                                storage_summary["SSD/NVMe Devices"] = str(ssd_count)
+                            if hdd_count > 0:
+                                storage_summary["HDD Devices"] = str(hdd_count)
+                            
+                            microbenchmark_list.append(storage_summary)
+                            
+                            # Individual device details
+                            for device in data["storage_devices"]:
+                                dev_info = OrderedDict()
+                                dev_info["Section"] = f"Storage: {device.get('name', 'Unknown')}"
+                                dev_info["Model"] = device.get("model", "Unknown")
+                                dev_info["Size"] = device.get("size", "Unknown")
+                                dev_info["Type"] = device.get("type", "Unknown")
+                                dev_info["Transport"] = device.get("transport", "Unknown")
+                                microbenchmark_list.append(dev_info)
+                        
+                        # NVMe Devices
+                        if data.get("nvme_devices"):
+                            for nvme in data["nvme_devices"]:
+                                nvme_info = OrderedDict()
+                                nvme_info["Section"] = f"NVMe: {nvme.get('Device', 'Unknown')}"
+                                nvme_info["Model"] = nvme.get("Model", "Unknown")
+                                nvme_info["Size"] = nvme.get("Size", "Unknown")
+                                nvme_info["Serial Number"] = nvme.get("Serial", "Unknown")
+                                nvme_info["Firmware"] = nvme.get("Firmware", "Unknown")
+                                nvme_info["Namespace"] = nvme.get("Namespace", "Unknown")
+                                microbenchmark_list.append(nvme_info)
+                        
+                        # RAID Configuration
+                        if data.get("raid_configs"):
+                            raid_summary = OrderedDict()
+                            raid_summary["Section"] = "RAID Configuration Detected"
+                            raid_summary["Arrays Found"] = str(len(data["raid_configs"]))
+                            microbenchmark_list.append(raid_summary)
+                            
+                            for raid in data["raid_configs"]:
+                                raid_info = OrderedDict()
+                                if "Array Device" in raid:
+                                    raid_info["Section"] = f"RAID: {raid.get('Array Device', 'Unknown')}"
+                                elif "LVM Volume" in raid:
+                                    raid_info["Section"] = f"LVM RAID: {raid.get('LVM Volume', 'Unknown')}"
+                                
+                                for key, value in raid.items():
+                                    if key not in ["Section", "Array Device", "LVM Volume"]:
+                                        raid_info[key] = value
+                                
+                                microbenchmark_list.append(raid_info)
+                        
+                        # GPU Direct Storage (GDS) Capability
+                        if data.get("gds_capability"):
+                            gds_info = OrderedDict()
+                            gds_info["Section"] = "GPU Direct Storage (GDS) Capability"
+                            
+                            for key, value in data["gds_capability"].items():
+                                gds_info[key] = value
+                            
+                            microbenchmark_list.append(gds_info)
+                        
+                        # Disk Benchmark Results (if any)
+                        if data.get("benchmark_results"):
+                            for bench in data["benchmark_results"]:
+                                bench_info = OrderedDict()
+                                bench_info["Section"] = f"Storage Benchmark: {bench.get('device', 'Unknown')}"
+                                
+                                for key, value in bench.items():
+                                    if key != "device":
+                                        bench_info[key] = value
+                                
+                                microbenchmark_list.append(bench_info)
+                                
+                except json.JSONDecodeError as e:
+                    error_info = OrderedDict()
+                    error_info["Section"] = "Storage I/O Profiling - Error"
+                    error_info["Message"] = f"JSON parsing failed: {str(e)}"
+                    microbenchmark_list.append(error_info)
+
+        # Add Network Performance Testing
+        network_py_file = os.path.join(script_dir, "network_benchmark.py")
+        
+        if os.path.exists(network_py_file):
+            if verbose:
+                print(f"Running network performance testing: {network_py_file}")
+            network_output = run_command(["python3", network_py_file])
+            
+            if network_output:
+                try:
+                    # Find JSON in output
+                    json_start = network_output.find("{")
+                    if json_start != -1:
+                        json_data = network_output[json_start:]
+                        data = json.loads(json_data)
+                        
+                        # RDMA Devices
+                        if data.get("rdma_devices"):
+                            rdma_summary = OrderedDict()
+                            rdma_summary["Section"] = "RDMA/InfiniBand Devices Detected"
+                            rdma_summary["Devices Found"] = str(len(data["rdma_devices"]))
+                            microbenchmark_list.append(rdma_summary)
+                            
+                            for rdma in data["rdma_devices"]:
+                                rdma_info = OrderedDict()
+                                rdma_info["Section"] = f"RDMA: {rdma.get('Device', 'Unknown')}"
+                                
+                                for key, value in rdma.items():
+                                    if key != "Device":
+                                        rdma_info[key] = value
+                                
+                                microbenchmark_list.append(rdma_info)
+                        
+                        # RoCE Capability
+                        if data.get("roce_capability"):
+                            roce_info = OrderedDict()
+                            roce_info["Section"] = "RoCE (RDMA over Converged Ethernet) Capability"
+                            
+                            for key, value in data["roce_capability"].items():
+                                roce_info[key] = value
+                            
+                            microbenchmark_list.append(roce_info)
+                        
+                        # Network Topology
+                        if data.get("network_topology"):
+                            topo_info = OrderedDict()
+                            topo_info["Section"] = "Network Topology Information"
+                            
+                            for key, value in data["network_topology"].items():
+                                topo_info[key] = value
+                            
+                            microbenchmark_list.append(topo_info)
+                        
+                        # Bandwidth Tools
+                        if data.get("bandwidth_tools"):
+                            bw_info = OrderedDict()
+                            bw_info["Section"] = "Network Bandwidth Testing Tools"
+                            
+                            for key, value in data["bandwidth_tools"].items():
+                                bw_info[key] = value
+                            
+                            microbenchmark_list.append(bw_info)
+                        
+                        # MPI Benchmarks
+                        if data.get("mpi_benchmarks"):
+                            mpi_info = OrderedDict()
+                            mpi_info["Section"] = "MPI Benchmark Tools"
+                            
+                            for key, value in data["mpi_benchmarks"].items():
+                                mpi_info[key] = value
+                            
+                            microbenchmark_list.append(mpi_info)
+                                
+                except json.JSONDecodeError as e:
+                    error_info = OrderedDict()
+                    error_info["Section"] = "Network Performance Testing - Error"
+                    error_info["Message"] = f"JSON parsing failed: {str(e)}"
+                    microbenchmark_list.append(error_info)
 
     if microbenchmark_list:
         details["linux"] = microbenchmark_list
@@ -2082,7 +2509,7 @@ def _parse_args() -> argparse.Namespace:
         "-a",
         "--all",
         action="store_true",
-        help="Collect all information (default if no specific flags are provided)",
+        help="Collect all basic information: CPU, GPU, Network, BMC, ROCm (does NOT include microbenchmarks - use -m)",
     )
     parser.add_argument(
         "-p",
@@ -2102,7 +2529,7 @@ def main() -> None:
     args = _parse_args()
 
     # Determine which sections to collect
-    # If no specific flags are provided, or -a is used, collect all
+    # If no specific flags are provided, or -a is used, collect all basic sections (NOT microbenchmarks)
     collect_all = args.all or not (args.cpu or args.gpu or args.network or args.bmc or args.rocm or args.microbenchmarks)
     
     collect_cpu = collect_all or args.cpu
@@ -2110,7 +2537,8 @@ def main() -> None:
     collect_network = collect_all or args.network
     collect_bmc = collect_all or args.bmc
     collect_rocm = collect_all or args.rocm or args.microbenchmarks  # ROCm is collected with microbenchmarks
-    collect_microbenchmarks = collect_all or args.microbenchmarks
+    # Microbenchmarks ONLY run when explicitly requested with -m flag
+    collect_microbenchmarks = args.microbenchmarks
 
     # Check and report tool availability at the beginning
     check_tool_availability(verbose=args.verbose)
@@ -2218,8 +2646,6 @@ def main() -> None:
         payload["rocm"] = []
     if microbenchmark_details:
         payload["microbenchmarks"] = microbenchmark_details
-    else:
-        payload["microbenchmarks"] = []
 
     # Generate filename with system name
     try:

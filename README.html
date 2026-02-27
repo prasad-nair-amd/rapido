@@ -306,7 +306,7 @@
                 </div>
                 <div class="feature-card">
                     <h4>GPU Microbenchmarks <span class="new-badge">ENHANCED</span></h4>
-                    <p>Peak performance calculations, GPU-to-GPU P2P bandwidth, and real-world kernel benchmarks (GEMM, convolution, memory bandwidth, vector ops).</p>
+                    <p>Peak performance calculations, GPU-to-GPU P2P bandwidth, GPU-CPU transfer bandwidth, XGMI/Infinity Fabric bandwidth matrix, NVLink equivalent topology analysis, and real-world kernel benchmarks (GEMM, convolution, memory bandwidth, vector ops).</p>
                 </div>
                 <div class="feature-card">
                     <h4>Tool Availability Check <span class="new-badge">NEW</span></h4>
@@ -480,11 +480,11 @@ hipcc -O3 -o gpu_kernel_benchmarks gpu_kernel_benchmarks.cpp
                 <tbody>
                     <tr>
                         <td>No arguments</td>
-                        <td>Collects all hardware information (CPU, GPU, Network, BMC, ROCm) - same as -a</td>
+                        <td>Collects all basic hardware information (CPU, GPU, Network, BMC, ROCm) - same as -a. <strong>Note: Microbenchmarks NOT included.</strong></td>
                     </tr>
                     <tr>
                         <td>-a, --all</td>
-                        <td>Collect all sections (CPU, GPU, Network, BMC, ROCm)</td>
+                        <td>Collect all basic sections (CPU, GPU, Network, BMC, ROCm). <strong>Does NOT include microbenchmarks - use -m for that.</strong></td>
                     </tr>
                     <tr>
                         <td>-c, --cpu</td>
@@ -527,7 +527,7 @@ hipcc -O3 -o gpu_kernel_benchmarks gpu_kernel_benchmarks.cpp
 
             <div class="info-box">
                 <strong>Note:</strong> The <code>-p</code> flag requires the <code>-m</code> flag to be effective.
-                Use <code>python3 rapido-collect.py -m -p</code> to enable both microbenchmarks and P2P testing.
+                Use <code>python3 rapido-collect.py -m -p</code> to enable microbenchmarks with P2P, GPU-CPU bandwidth, and XGMI/Infinity Fabric topology testing.
             </div>
 
             <h3>rapido-report.py</h3>
@@ -626,12 +626,18 @@ hipcc -O3 -o gpu_kernel_benchmarks gpu_kernel_benchmarks.cpp
                     </ul>
                 </li>
                 <li><strong>ROCm Tab</strong> - ROCm runtime environment and installation details</li>
-                <li><strong>Microbenchmarks Tab</strong> - GPU peak performance, kernel benchmarks, and P2P bandwidth:
+                <li><strong>Microbenchmarks Tab</strong> - GPU peak performance, kernel benchmarks, and bandwidth measurements:
                     <ul>
-                        <li>Peak FP32, FP64, FP16, INT8 performance calculations</li>
-                        <li><strong>Kernel Benchmarks (NEW):</strong> GEMM FP32/FP64, memory bandwidth, vector operations, FMA throughput, 1D convolution</li>
+                        <li><strong>Dense Peak Performance:</strong> FP64, FP32, TF32, FP16/BF16, FP8, INT8 calculations for standard matrix/vector operations</li>
+                        <li><strong>Sparse Peak Performance:</strong> 2:1 sparse matrix performance (50% sparsity) with FP64, FP32, TF32, FP16/BF16, FP8 range, INT8</li>
+                        <li><strong>Kernel Benchmarks:</strong> GEMM FP32/FP64, memory bandwidth, vector operations, FMA throughput, 1D convolution</li>
                         <li>GPU-to-GPU P2P bandwidth measurements (all pairs)</li>
+                        <li>GPU-CPU transfer bandwidth measurements (host-to-device and device-to-host, pageable vs pinned)</li>
+                        <li>XGMI/Infinity Fabric bandwidth matrix for multi-GPU topology</li>
+                        <li>NVLink equivalent topology analysis with inter-GPU link speeds</li>
                         <li>P2P capability detection</li>
+                        <li><strong>Storage I/O Profiling:</strong> Storage device detection (SSD/HDD/NVMe), NVMe performance metrics, RAID configuration detection, GPU Direct Storage (GDS) capability testing</li>
+                        <li><strong>Network Performance Testing:</strong> Network bandwidth tools detection (iperf3), RDMA/InfiniBand device detection, RoCE capability testing, multi-node network topology mapping, MPI benchmark tools availability (OSU Micro-Benchmarks, Intel MPI Benchmarks)</li>
                     </ul>
                 </li>
             </ul>
@@ -647,10 +653,10 @@ hipcc -O3 -o gpu_kernel_benchmarks gpu_kernel_benchmarks.cpp
                 For example, if you collected only CPU and GPU data using <code>-c -g</code> flags, only CPU and GPU tabs will be shown in the report.
             </div>
 
-            <h2>GPU P2P Bandwidth Testing <span class="new-badge">NEW</span></h2>
-            <p>The GPU peer-to-peer bandwidth benchmark measures direct GPU-to-GPU communication speeds:</p>
+            <h2>GPU Bandwidth Testing <span class="new-badge">ENHANCED</span></h2>
+            <p>The GPU bandwidth benchmarks measure various data transfer speeds in the system:</p>
 
-            <h3>How It Works</h3>
+            <h3>GPU-to-GPU P2P Bandwidth</h3>
             <ul>
                 <li>Tests all GPU pairs in the system (bidirectional)</li>
                 <li>Uses 256 MB transfers over 10 iterations for accurate measurements</li>
@@ -658,22 +664,41 @@ hipcc -O3 -o gpu_kernel_benchmarks gpu_kernel_benchmarks.cpp
                 <li>Reports bandwidth in GB/s for each connection</li>
             </ul>
 
-            <h3>Compiling the Benchmark</h3>
+            <h3>GPU-CPU Transfer Bandwidth <span class="new-badge">NEW</span></h3>
+            <ul>
+                <li>Measures host-to-device (H2D) transfer speeds</li>
+                <li>Measures device-to-host (D2H) transfer speeds</li>
+                <li>Tests pinned (page-locked) memory performance</li>
+                <li>Identifies PCIe bottlenecks and memory transfer efficiency</li>
+            </ul>
+
+            <h3>XGMI/Infinity Fabric Topology <span class="new-badge">NEW</span></h3>
+            <ul>
+                <li>Maps AMD Infinity Fabric interconnect between GPUs</li>
+                <li>Displays bandwidth matrix showing link speeds between all GPU pairs</li>
+                <li>Identifies XGMI links (high-speed GPU-GPU interconnect)</li>
+                <li>Equivalent to NVIDIA's NVLink topology analysis</li>
+                <li>Shows hops count and link types in multi-GPU configurations</li>
+            </ul>
+
+            <h3>Compiling the Benchmarks</h3>
             <div class="code-block">
-<span class="comment"># Compile with hipcc (requires ROCm installation)</span>
+<span class="comment"># Compile P2P bandwidth benchmark (requires ROCm installation)</span>
 <span class="command">hipcc</span> -o gpu_p2p_bandwidth gpu_p2p_bandwidth.cpp
 
-<span class="comment"># The compiled binary is automatically used by rapido-collect.py</span>
+<span class="comment"># Compile kernel benchmarks</span>
+<span class="command">hipcc</span> -O3 -o gpu_kernel_benchmarks gpu_kernel_benchmarks.cpp
+
+<span class="comment"># The compiled binaries are automatically used by rapido-collect.py</span>
 <span class="command">python3</span> rapido-collect.py -m -p
             </div>
 
-            <h3>Output Example</h3>
-            <p>P2P bandwidth results appear in the Microbenchmarks tab showing:</p>
+            <h3>Output Examples</h3>
+            <p>Bandwidth results appear in the Microbenchmarks tab showing:</p>
             <ul>
-                <li>Source GPU and destination GPU</li>
-                <li>GPU architecture names</li>
-                <li>P2P enabled/disabled status</li>
-                <li>Bandwidth in GB/s</li>
+                <li><strong>P2P Bandwidth:</strong> Source GPU, destination GPU, architecture names, P2P enabled status, bandwidth in GB/s</li>
+                <li><strong>GPU-CPU Bandwidth:</strong> H2D/D2H speeds, pinned vs pageable memory performance</li>
+                <li><strong>XGMI Topology:</strong> Bandwidth matrix, link types (XGMI/PCIe), hops count, interconnect speeds</li>
             </ul>
 
             <h2>BMC Information Collection <span class="new-badge">NEW</span></h2>

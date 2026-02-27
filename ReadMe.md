@@ -9,6 +9,10 @@ AMD Rapido is a Python-based hardware profiling toolkit for AMD GPU-equipped ser
 - **rapido-report.py** - Generates interactive HTML comparison reports from JSON files
 - **gpu_p2p_bandwidth.cpp** - HIP-based GPU-to-GPU peer-to-peer bandwidth benchmark
 - **gpu_kernel_benchmarks.cpp** - HIP-based compute kernel benchmarks (GEMM, convolution, memory bandwidth)
+- **gpu_host_bandwidth.cpp** - HIP-based GPU-CPU transfer bandwidth benchmark (H2D/D2H)
+- **gpu_topology.cpp** - HIP-based XGMI/Infinity Fabric topology analysis (NVLink equivalent)
+- **storage_benchmark.py** - Storage I/O profiling (device detection, NVMe metrics, RAID config, GDS capability)
+- **network_benchmark.py** - Network performance testing (bandwidth tools, RDMA/RoCE detection, topology, MPI benchmarks)
 
 The tool is designed for Linux systems with AMD GPUs and ROCm, but includes basic support for Windows and macOS.
 
@@ -24,6 +28,7 @@ When rapido-collect.py runs, it automatically checks for all required and option
 ### Data Collection
 ```bash
 # Basic collection - all sections (CPU, GPU, Network, BMC, ROCm) - quiet mode
+# NOTE: Microbenchmarks are NOT included with -a, must use -m explicitly
 python3 rapido-collect.py
 # or explicitly
 python3 rapido-collect.py -a
@@ -65,15 +70,17 @@ python3 rapido-report.py -i serverinfo_server1.json -o report.html
 
 ### GPU Benchmarks
 ```bash
-# Compile the P2P benchmark (requires ROCm and hipcc)
+# Compile all benchmarks (requires ROCm and hipcc)
 hipcc -o gpu_p2p_bandwidth gpu_p2p_bandwidth.cpp
-
-# Compile the kernel benchmarks
 hipcc -O3 -o gpu_kernel_benchmarks gpu_kernel_benchmarks.cpp
+hipcc -o gpu_host_bandwidth gpu_host_bandwidth.cpp
+hipcc -o gpu_topology gpu_topology.cpp
 
 # Run directly (optional - rapido-collect.py does this automatically)
 ./gpu_p2p_bandwidth
 ./gpu_kernel_benchmarks
+./gpu_host_bandwidth
+./gpu_topology
 ```
 
 ## Architecture
@@ -103,10 +110,11 @@ hipcc -O3 -o gpu_kernel_benchmarks gpu_kernel_benchmarks.cpp
 - `-b` or `--bmc`: Collect BMC information only
 - `-r` or `--rocm`: Collect ROCm information only
 - `-m` or `--microbenchmarks`: Collect microbenchmarks only (automatically includes ROCm)
-- `-a` or `--all`: Collect all sections (default if no specific flags provided)
+- `-a` or `--all`: Collect all basic sections: CPU, GPU, Network, BMC, ROCm (NOT microbenchmarks)
 - Flags can be combined: `-c -g -n` collects CPU, GPU, and Network only
 - When any specific flag is used, only those sections are collected
-- When no flags or `-a` is used, all sections are collected
+- When no flags or `-a` is used, all basic sections are collected (CPU, GPU, Network, BMC, ROCm)
+- **Important**: Microbenchmarks are ONLY collected when `-m` flag is explicitly specified
 - Note: `-m` flag automatically enables ROCm collection (microbenchmarks need ROCm info)
 
 **Error handling and crash protection**:
@@ -146,8 +154,16 @@ hipcc -O3 -o gpu_kernel_benchmarks gpu_kernel_benchmarks.cpp
   
 - `gather_gpu_microbenchmarks(include_p2p)` - Linux-only GPU benchmarking
   - Parses `rocminfo` to extract GPU specs (CUs, clock, memory)
-  - Calculates peak performance: FP32, FP64, FP16, BF16, INT8, FP8, FP4 based on architecture
-  - If `include_p2p=True`: compiles and runs `gpu_p2p_bandwidth.cpp`, parses JSON output
+  - Calculates peak performance with separate Dense and Sparse cards:
+    - **Dense**: FP64, FP32, TF32 (CDNA2+), FP16/BF16, FP8 (CDNA3), INT8
+    - **Sparse**: 2:1 sparse matrix operations (50% sparsity, 2x dense for CDNA), FP8 shown as range
+  - Compiles and runs `gpu_kernel_benchmarks.cpp` for real-world kernel performance
+  - If `include_p2p=True`: compiles and runs additional benchmarks:
+    - `gpu_p2p_bandwidth.cpp` - GPU-to-GPU communication bandwidth
+    - `gpu_host_bandwidth.cpp` - GPU-CPU transfer bandwidth (H2D/D2H, pageable/pinned)
+    - `gpu_topology.cpp` - XGMI/Infinity Fabric topology analysis with bandwidth matrix
+    - `storage_benchmark.py` - Storage I/O profiling (always runs with microbenchmarks)
+    - `network_benchmark.py` - Network performance testing (always runs with microbenchmarks)
 
 **Output structure**: JSON file `serverinfo_<hostname>.json` with sections:
 - `_metadata`: Collection metadata (date, status, errors) - added in v2.1
@@ -239,6 +255,171 @@ hipcc -O3 -o gpu_kernel_benchmarks gpu_kernel_benchmarks.cpp
    - Representative of signal processing and ML workloads
 
 **Output**: JSON with per-GPU results including GFLOPS/TFLOPS and bandwidth measurements
+
+### gpu_host_bandwidth.cpp (HIP GPU-CPU bandwidth benchmark)
+**Purpose**: Measures data transfer speeds between GPU and CPU (host) memory
+
+**Benchmarks included**:
+1. **Host-to-Device (H2D)** - Pageable memory
+   - Standard malloc() host memory to GPU device memory
+   - Tests typical CPU→GPU data upload performance
+   
+2. **Device-to-Host (D2H)** - Pageable memory
+   - GPU device memory to standard malloc() host memory
+   - Tests typical GPU→CPU data download performance
+   
+3. **Host-to-Device (H2D)** - Pinned memory
+   - Page-locked (hipHostMalloc) memory to GPU device memory
+   - Tests optimized CPU→GPU transfer performance
+   
+4. **Device-to-Host (D2H)** - Pinned memory
+   - GPU device memory to page-locked host memory
+   - Tests optimized GPU→CPU transfer performance
+
+**Methodology**:
+- 256 MB transfers × 10 iterations per test
+- Warm-up runs to eliminate one-time costs
+- Compares pageable vs pinned memory performance
+- Identifies PCIe bandwidth bottlenecks
+
+**Output**: JSON with per-GPU H2D/D2H bandwidth results in GB/s for both pageable and pinned memory
+
+### gpu_topology.cpp (HIP topology analyzer)
+**Purpose**: Analyzes AMD GPU interconnect topology - equivalent to NVIDIA's NVLink analysis
+
+**Features**:
+1. **Bandwidth Matrix** - Measures actual transfer speeds between all GPU pairs
+2. **Link Type Detection**:
+   - **XGMI** - AMD Infinity Fabric direct GPU-GPU links (high-speed)
+   - **XGMI-2hop/3hop** - Multi-hop XGMI connections
+   - **PCIe** - PCIe-based GPU communication (lower speed)
+   - **No P2P** - No peer-to-peer access available
+   
+3. **Topology Information**:
+   - Reads `/sys/class/drm/card*/device/xgmi_hive_info/node_*_hops` for hop counts
+   - Uses `amd-smi topology --json` if available
+   - Measures real bandwidth for each link
+   - Identifies NUMA domains and socket topology
+   
+4. **Link Performance Analysis**:
+   - Tests smaller transfers (64 MB) for faster topology mapping
+   - 5 iterations per GPU pair
+   - Identifies bottlenecks in multi-GPU configurations
+
+**Output**: JSON with:
+- GPU list with names and PCI IDs
+- Full bandwidth matrix (N×N for N GPUs)
+- Link types and hop counts for each connection
+- Summary of XGMI vs PCIe links
+
+### storage_benchmark.py (Storage I/O profiling)
+**Purpose**: Comprehensive storage system analysis for HPC/AI workloads
+
+**Features**:
+1. **Storage Device Detection**:
+   - Uses `lsblk -J` to enumerate all block devices
+   - Identifies SSD vs HDD (rotational flag)
+   - Detects transport type (SATA, NVMe, SAS, etc.)
+   - Reports model, size, and device path
+   
+2. **NVMe Performance Metrics**:
+   - Uses `nvme list -o json` to get NVMe-specific details
+   - Reports model, serial number, firmware version
+   - Shows namespace information
+   - Identifies NVMe device capabilities
+   
+3. **RAID Configuration Detection**:
+   - Uses `mdadm` to detect hardware/software RAID arrays
+   - Shows RAID level (RAID0, RAID1, RAID5, RAID6, RAID10)
+   - Reports array size and device count
+   - Detects LVM RAID configurations
+   - Shows RAID state (active, degraded, etc.)
+   
+4. **GPU Direct Storage (GDS) Capability**:
+   - Checks for GDS kernel modules (`nvidia_fs`, `gdrdrv`)
+   - Detects cuFile library installation
+   - Verifies GDS configuration files
+   - Reports overall GDS capability status
+   - Note: GDS is primarily NVIDIA technology; AMD equivalent may vary
+   
+5. **Optional Disk Benchmarks** (disabled by default):
+   - Sequential read/write tests using `dd`
+   - Direct I/O to bypass page cache
+   - Configurable test size
+   - Can be enabled by uncommenting code in `storage_benchmark.py`
+
+**Methodology**:
+- Non-destructive testing (no existing data modified)
+- Uses temporary directory for benchmark tests
+- Requires root/sudo for some operations (RAID detection, cache clearing)
+- Fast device enumeration (~1-2 seconds)
+- Optional benchmarks can add 30-60 seconds per device
+
+**Output**: JSON with:
+- `storage_devices`: List of all detected storage devices with type/model/size
+- `nvme_devices`: NVMe-specific details (if NVMe present)
+- `raid_configs`: RAID array configurations (if RAID detected)
+- `gds_capability`: GPU Direct Storage capability flags
+- `benchmark_results`: Optional disk speed test results
+
+### network_benchmark.py (Network performance testing)
+**Purpose**: Comprehensive network performance analysis for HPC/AI multi-node clusters
+
+**Features**:
+1. **RDMA/InfiniBand Device Detection**:
+   - Uses `ibstat` to detect InfiniBand devices
+   - Uses `rdma link show` for RoCE devices
+   - Reports device type, state, firmware version
+   - Shows link rate and physical state
+   - Displays LID (Local Identifier) for IB fabric
+   
+2. **RoCE (RDMA over Converged Ethernet) Capability**:
+   - Detects RDMA kernel modules (rdma_*, ib_*, mlx*)
+   - Checks `/sys/class/infiniband` for InfiniBand devices
+   - Verifies rdma-core package installation
+   - Checks for RDMA performance tools (ib_send_bw, etc.)
+   - Reports overall RoCE capability status
+   
+3. **Multi-Node Network Topology Mapping**:
+   - Reports hostname and active network interfaces
+   - Shows interface state, MTU, and IP addresses
+   - Detects MPI installation (mpirun/mpiexec)
+   - Reports MPI version (OpenMPI, MPICH, Intel MPI)
+   - Identifies interfaces suitable for cluster communication
+   
+4. **Network Bandwidth Testing Tools**:
+   - Detects iperf3 installation
+   - Provides usage notes for multi-node testing
+   - Reports capability for bandwidth measurements
+   - Note: Actual bandwidth tests require running iperf3 server on remote node
+   
+5. **MPI Benchmark Tools Detection**:
+   - Detects OSU Micro-Benchmarks (osu_bw, osu_latency, osu_bibw)
+   - Checks for Intel MPI Benchmarks (IMB-MPI1)
+   - Reports installation paths and available tests
+   - Provides usage examples for multi-node MPI testing
+   - Note: MPI benchmarks require multi-node cluster setup
+
+**Methodology**:
+- Detection-only (no actual network traffic generated)
+- Fast execution (~1-2 seconds)
+- Safe to run on production systems
+- Provides readiness assessment for network performance testing
+- Actual performance tests require multi-node cluster environment
+
+**Multi-Node Testing Notes**:
+- For iperf3: Run `iperf3 -s` on one node, `iperf3 -c <host>` on another
+- For OSU: `mpirun -np 2 -host node1,node2 osu_bw`
+- For IMB: `mpirun -np 2 -host node1,node2 IMB-MPI1 PingPong`
+- Requires passwordless SSH between nodes
+- Requires MPI installation with network fabric support (IB, RoCE)
+
+**Output**: JSON with:
+- `rdma_devices`: List of detected RDMA/InfiniBand devices
+- `roce_capability`: RoCE capability flags and module status
+- `network_topology`: Hostname, interfaces, MPI availability
+- `bandwidth_tools`: iperf3 availability and usage notes
+- `mpi_benchmarks`: MPI benchmark tool availability and paths
 
 ## Important Data Structures
 
