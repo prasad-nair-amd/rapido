@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 import argparse
 import json
+import sys
 from html import escape
 from pathlib import Path
 from typing import Any, Dict, List, Optional
@@ -170,6 +171,14 @@ def generate_comparison_html(file1_path: Optional[Path], file2_path: Optional[Pa
     file1_name = file1_path.name if file1_path else "N/A"
     file2_name = file2_path.name if file2_path else "N/A"
 
+    # Extract command lines from metadata
+    command_line1 = ""
+    command_line2 = ""
+    if data1 and "_metadata" in data1:
+        command_line1 = data1["_metadata"].get("command_line", "")
+    if data2 and "_metadata" in data2:
+        command_line2 = data2["_metadata"].get("command_line", "")
+
     # Check which sections have data in either file
     has_cpu = False
     has_gpu = False
@@ -315,6 +324,42 @@ def generate_comparison_html(file1_path: Optional[Path], file2_path: Optional[Pa
             background: rgba(255,255,255,0.2);
             padding: 8px 16px;
             border-radius: 4px;
+        }}
+
+        .command-toggle {{
+            margin-top: 15px;
+            cursor: pointer;
+            font-size: 0.85rem;
+            opacity: 0.8;
+            user-select: none;
+            transition: opacity 0.2s;
+        }}
+
+        .command-toggle:hover {{
+            opacity: 1;
+        }}
+
+        .command-section {{
+            max-height: 0;
+            overflow: hidden;
+            transition: max-height 0.3s ease-out;
+            margin-top: 10px;
+        }}
+
+        .command-section.expanded {{
+            max-height: 300px;
+        }}
+
+        .command-box {{
+            background: rgba(0,0,0,0.2);
+            padding: 10px 15px;
+            border-radius: 4px;
+            font-family: 'Courier New', monospace;
+            font-size: 0.85rem;
+            text-align: left;
+            margin: 10px auto;
+            max-width: 90%;
+            word-break: break-all;
         }}
 
         .tabs {{
@@ -494,6 +539,11 @@ def generate_comparison_html(file1_path: Optional[Path], file2_path: Optional[Pa
                 <div class="file-info"><strong>File 1:</strong> {escape(file1_name)}</div>
                 <div class="file-info"><strong>File 2:</strong> {escape(file2_name)}</div>
             </div>''' if is_comparison else f'<div class="file-names"><div class="file-info">{escape(file1_name or file2_name)}</div></div>'}
+            {f'''<div class="command-toggle" onclick="toggleCommand()">▼ Show collection command{"s" if is_comparison else ""}</div>
+            <div class="command-section" id="commandSection">
+                {f'<div style="margin-bottom: 10px;"><strong>File 1 Collection:</strong></div><div class="command-box">{escape(command_line1)}</div>' if command_line1 else ''}
+                {f'<div style="margin-bottom: 10px; margin-top: 15px;"><strong>File 2 Collection:</strong></div><div class="command-box">{escape(command_line2)}</div>' if command_line2 and is_comparison else ''}
+            </div>''' if (command_line1 or command_line2) else ''}
         </div>
 
         <div class="tabs" id="tabs-container">
@@ -650,6 +700,20 @@ def generate_comparison_html(file1_path: Optional[Path], file2_path: Optional[Pa
                 }});
             }} catch (e) {{
                 console.error('Error restoring tab order:', e);
+            }}
+        }}
+
+        function toggleCommand() {{
+            const section = document.getElementById('commandSection');
+            const toggle = document.querySelector('.command-toggle');
+            if (section.classList.contains('expanded')) {{
+                section.classList.remove('expanded');
+                const originalText = toggle.textContent.replace('▲ Hide', '▼ Show');
+                toggle.textContent = originalText;
+            }} else {{
+                section.classList.add('expanded');
+                const hiddenText = toggle.textContent.replace('▼ Show', '▲ Hide');
+                toggle.textContent = hiddenText;
             }}
         }}
 

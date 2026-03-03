@@ -245,7 +245,18 @@
                     <li><strong>rapido-report.py</strong> - Generates HTML comparison reports from JSON files</li>
                     <li><strong>gpu_p2p_bandwidth.cpp</strong> - GPU-to-GPU peer-to-peer bandwidth benchmark (HIP)</li>
                     <li><strong>gpu_kernel_benchmarks.cpp</strong> - Comprehensive GPU compute kernel benchmarks (GEMM, convolution, memory bandwidth)</li>
+                    <li><strong>gpu_host_bandwidth.cpp</strong> - GPU-CPU transfer bandwidth benchmark (H2D/D2H, pageable/pinned)</li>
+                    <li><strong>gpu_topology.cpp</strong> - XGMI/Infinity Fabric topology analysis (NVLink equivalent)</li>
+                    <li><strong>storage_benchmark.py</strong> - Storage I/O profiling (device detection, NVMe metrics, RAID config, GDS capability)</li>
+                    <li><strong>network_benchmark.py</strong> - Network performance testing (bandwidth tools, RDMA/RoCE detection, topology, MPI benchmarks)</li>
                 </ul>
+            </div>
+
+            <h2>Report Preview</h2>
+            <p>AMD Rapido generates interactive HTML reports with side-by-side comparison capabilities and tabbed navigation:</p>
+            <div style="text-align: center; margin: 30px 0;">
+                <img src="Screenshot.png" alt="AMD Rapido Comparison Report Screenshot" style="max-width: 100%; border: 2px solid #667eea; border-radius: 8px; box-shadow: 0 4px 8px rgba(0,0,0,0.2);">
+                <p style="margin-top: 10px; font-style: italic; color: #666;">Example: Side-by-side ROCm comparison showing version information and installed packages</p>
             </div>
 
             <h2>What's New in Version 2.2 <span class="new-badge">NEW</span></h2>
@@ -255,6 +266,8 @@
                     <li><strong>Selective Data Collection</strong> - New flags (-c, -g, -n, -b, -r, -m) to collect specific hardware sections only, reducing collection time</li>
                     <li><strong>Dynamic Tab Visibility</strong> - Report tabs now only appear when data is available, providing cleaner UI</li>
                     <li><strong>Conditional Report Titles</strong> - Report title shows "Comparison" only when comparing two devices</li>
+                    <li><strong>Collection Command Display</strong> - Reports now include a hidden section showing the exact command(s) used to collect the data (click "Show collection command(s)" in the report header)</li>
+                    <li><strong>Proactive Health Checks</strong> - GPU memory error detection (ECC), PCIe link verification, thermal/power throttling detection, XGMI link error rates</li>
                     <li><strong>Enhanced Error Handling</strong> - Comprehensive JSON validation, crash protection, and partial data saving on interruption</li>
                     <li><strong>Improved GPU Compatibility</strong> - Support for both old and new amd-smi JSON formats</li>
                     <li><strong>Metadata Tracking</strong> - Collection status, timestamps, and error logging in JSON output</li>
@@ -306,7 +319,7 @@
                 </div>
                 <div class="feature-card">
                     <h4>GPU Microbenchmarks <span class="new-badge">ENHANCED</span></h4>
-                    <p>Peak performance calculations, GPU-to-GPU P2P bandwidth, GPU-CPU transfer bandwidth, XGMI/Infinity Fabric bandwidth matrix, NVLink equivalent topology analysis, and real-world kernel benchmarks (GEMM, convolution, memory bandwidth, vector ops).</p>
+                    <p>Peak performance calculations, GPU-to-GPU P2P bandwidth, GPU-CPU transfer bandwidth (H2D/D2H, pageable/pinned), XGMI/Infinity Fabric topology analysis (NVLink equivalent), real-world kernel benchmarks (GEMM, convolution, memory bandwidth, vector ops), proactive health checks (ECC errors, PCIe link verification, thermal/power throttling, XGMI error rates), storage I/O profiling (NVMe, RAID, GDS), and network performance testing (RDMA/RoCE, MPI benchmarks).</p>
                 </div>
                 <div class="feature-card">
                     <h4>Tool Availability Check <span class="new-badge">NEW</span></h4>
@@ -568,7 +581,7 @@ hipcc -O3 -o gpu_kernel_benchmarks gpu_kernel_benchmarks.cpp
             <h3>JSON Output (rapido-collect.py)</h3>
             <p>The JSON file contains structured hardware information organized into sections:</p>
             <ul>
-                <li><strong>_metadata</strong> - Collection metadata (date, status, errors) <span class="new-badge">NEW</span></li>
+                <li><strong>_metadata</strong> - Collection metadata (date, status, errors, command line) <span class="new-badge">ENHANCED</span></li>
                 <li><strong>cpu</strong> - CPU information (manufacturer, cores, threads, frequency, cache)</li>
                 <li><strong>gpu</strong> - GPU details (name, VRAM, compute units, drivers, architecture, ASIC info, PCIe, VBIOS, power/thermal limits, cache, NUMA, RAS, firmware)</li>
                 <li><strong>network</strong> - Network interfaces (name, state, MAC/IP addresses, speed, duplex, driver/firmware, PCI address, RX/TX stats)</li>
@@ -578,7 +591,14 @@ hipcc -O3 -o gpu_kernel_benchmarks gpu_kernel_benchmarks.cpp
             </ul>
 
             <div class="info-box">
-                <strong>Metadata Tracking:</strong> Each JSON file now includes a <code>_metadata</code> section with collection timestamp, status (complete/partial), and any errors encountered during collection.
+                <strong>Metadata Tracking:</strong> Each JSON file now includes a <code>_metadata</code> section with:
+                <ul>
+                    <li>Collection timestamp (ISO format)</li>
+                    <li>Collection status (complete/partial)</li>
+                    <li>Any errors encountered during collection</li>
+                    <li>Exact command line used to collect the data</li>
+                </ul>
+                This metadata enables full traceability and reproducibility of data collection.
             </div>
 
             <h3>HTML Report (rapido-report.py)</h3>
@@ -636,6 +656,7 @@ hipcc -O3 -o gpu_kernel_benchmarks gpu_kernel_benchmarks.cpp
                         <li>XGMI/Infinity Fabric bandwidth matrix for multi-GPU topology</li>
                         <li>NVLink equivalent topology analysis with inter-GPU link speeds</li>
                         <li>P2P capability detection</li>
+                        <li><strong>Proactive Health Checks:</strong> GPU memory error detection (ECC errors, correctable/uncorrectable), PCIe link speed/width verification (detect downgraded links), thermal throttling detection, power capping identification, XGMI link error rates</li>
                         <li><strong>Storage I/O Profiling:</strong> Storage device detection (SSD/HDD/NVMe), NVMe performance metrics, RAID configuration detection, GPU Direct Storage (GDS) capability testing</li>
                         <li><strong>Network Performance Testing:</strong> Network bandwidth tools detection (iperf3), RDMA/InfiniBand device detection, RoCE capability testing, multi-node network topology mapping, MPI benchmark tools availability (OSU Micro-Benchmarks, Intel MPI Benchmarks)</li>
                     </ul>
@@ -651,6 +672,21 @@ hipcc -O3 -o gpu_kernel_benchmarks gpu_kernel_benchmarks.cpp
             <div class="success-box">
                 <strong>Dynamic Tab Visibility:</strong> Tabs only appear when data is available for that section.
                 For example, if you collected only CPU and GPU data using <code>-c -g</code> flags, only CPU and GPU tabs will be shown in the report.
+            </div>
+
+            <div class="info-box">
+                <strong>Command Line Traceability:</strong> Each generated report includes a hidden section in the header showing the exact command(s) used to collect the data.
+                Click "▼ Show collection command(s)" in the report header to see the full command line(s) used during data collection.
+                This feature helps with:
+                <ul>
+                    <li>Reproducing data collection with the same parameters</li>
+                    <li>Understanding which hardware sections were collected (-c, -g, -n, etc.)</li>
+                    <li>Documenting data collection for audit trails</li>
+                    <li>Troubleshooting collection issues</li>
+                    <li>Verifying if microbenchmarks or P2P tests were included</li>
+                    <li>Comparing collection methods between different servers</li>
+                </ul>
+                <strong>Note:</strong> The collection command is automatically captured when using rapido-collect.py and stored in the JSON metadata.
             </div>
 
             <h2>GPU Bandwidth Testing <span class="new-badge">ENHANCED</span></h2>
@@ -689,17 +725,91 @@ hipcc -O3 -o gpu_kernel_benchmarks gpu_kernel_benchmarks.cpp
 <span class="comment"># Compile kernel benchmarks</span>
 <span class="command">hipcc</span> -O3 -o gpu_kernel_benchmarks gpu_kernel_benchmarks.cpp
 
+<span class="comment"># Compile GPU-CPU bandwidth benchmark</span>
+<span class="command">hipcc</span> -o gpu_host_bandwidth gpu_host_bandwidth.cpp
+
+<span class="comment"># Compile XGMI/Infinity Fabric topology analyzer</span>
+<span class="command">hipcc</span> -o gpu_topology gpu_topology.cpp
+
 <span class="comment"># The compiled binaries are automatically used by rapido-collect.py</span>
 <span class="command">python3</span> rapido-collect.py -m -p
             </div>
+
+            <h3>Storage I/O Profiling <span class="new-badge">NEW</span></h3>
+            <ul>
+                <li>Automatic detection of all storage devices (SSD/HDD/NVMe)</li>
+                <li>NVMe-specific performance metrics and capabilities</li>
+                <li>Hardware/software RAID configuration detection (RAID0/1/5/6/10)</li>
+                <li>GPU Direct Storage (GDS) capability testing</li>
+                <li>Fast, non-destructive testing (~1-2 seconds)</li>
+            </ul>
+
+            <h3>Network Performance Testing <span class="new-badge">NEW</span></h3>
+            <ul>
+                <li>RDMA/InfiniBand device detection and state reporting</li>
+                <li>RoCE (RDMA over Converged Ethernet) capability testing</li>
+                <li>Multi-node network topology mapping with MPI detection</li>
+                <li>Network bandwidth testing tools availability (iperf3)</li>
+                <li>MPI benchmark tools detection (OSU Micro-Benchmarks, Intel MPI Benchmarks)</li>
+                <li>Provides usage examples for multi-node cluster testing</li>
+            </ul>
 
             <h3>Output Examples</h3>
             <p>Bandwidth results appear in the Microbenchmarks tab showing:</p>
             <ul>
                 <li><strong>P2P Bandwidth:</strong> Source GPU, destination GPU, architecture names, P2P enabled status, bandwidth in GB/s</li>
-                <li><strong>GPU-CPU Bandwidth:</strong> H2D/D2H speeds, pinned vs pageable memory performance</li>
-                <li><strong>XGMI Topology:</strong> Bandwidth matrix, link types (XGMI/PCIe), hops count, interconnect speeds</li>
+                <li><strong>GPU-CPU Bandwidth:</strong> H2D/D2H speeds for both pageable and pinned memory, identifying PCIe bottlenecks</li>
+                <li><strong>XGMI Topology:</strong> Full bandwidth matrix, link types (XGMI/PCIe), hops count, interconnect speeds between all GPU pairs</li>
+                <li><strong>Storage I/O:</strong> Device list with types, NVMe details, RAID configurations, GDS capability status</li>
+                <li><strong>Network Performance:</strong> RDMA/InfiniBand devices, RoCE capability, MPI availability, bandwidth tool detection</li>
+                <li><strong>Proactive Health Checks:</strong> ECC error status, PCIe link health, thermal/power throttling detection, XGMI link error rates</li>
             </ul>
+
+            <h2>Proactive Health Checks <span class="new-badge">NEW</span></h2>
+            <p>The microbenchmarks section includes comprehensive GPU health monitoring to detect potential hardware issues:</p>
+
+            <h3>Health Check Features</h3>
+            <ul>
+                <li><strong>GPU Memory Error Detection</strong>
+                    <ul>
+                        <li>ECC error monitoring (correctable and uncorrectable errors)</li>
+                        <li>Memory error counts and trends</li>
+                        <li>Identifies failing memory modules requiring RMA</li>
+                    </ul>
+                </li>
+                <li><strong>PCIe Link Speed/Width Verification</strong>
+                    <ul>
+                        <li>Detects downgraded PCIe links (Gen3 instead of Gen4/5)</li>
+                        <li>Verifies PCIe lane width (x8 vs x16)</li>
+                        <li>Identifies motherboard slot or cable issues</li>
+                    </ul>
+                </li>
+                <li><strong>Thermal Throttling Detection</strong>
+                    <ul>
+                        <li>Monitors GPU temperature thresholds</li>
+                        <li>Detects performance reduction due to thermal limits</li>
+                        <li>Identifies cooling system problems</li>
+                    </ul>
+                </li>
+                <li><strong>Power Capping Identification</strong>
+                    <ul>
+                        <li>Detects configured power limits</li>
+                        <li>Identifies performance reduction due to power constraints</li>
+                        <li>Reports power capping configuration</li>
+                    </ul>
+                </li>
+                <li><strong>XGMI Link Error Rates</strong>
+                    <ul>
+                        <li>Monitors Infinity Fabric link errors</li>
+                        <li>Detects communication issues between GPUs</li>
+                        <li>Identifies degraded multi-GPU interconnects</li>
+                    </ul>
+                </li>
+            </ul>
+
+            <div class="success-box">
+                <strong>Automatic Detection:</strong> Health checks run automatically during microbenchmark collection (<code>-m</code> flag) and results appear in the Microbenchmarks tab with clear warnings for any detected issues.
+            </div>
 
             <h2>BMC Information Collection <span class="new-badge">NEW</span></h2>
             <p>The BMC tab provides comprehensive baseboard management controller information via IPMI:</p>
@@ -982,6 +1092,10 @@ done
                     <li>Selective data collection with flags: -c (CPU), -g (GPU), -n (Network), -b (BMC), -r (ROCm), -m (Microbenchmarks)</li>
                     <li>Dynamic tab visibility - tabs only appear when data is available</li>
                     <li>Conditional report titles - "Comparison" only shows when comparing two devices</li>
+                    <li>Command line traceability - reports show the exact command(s) used to collect the data (collapsible section in header)</li>
+                    <li>Proactive health checks - ECC errors, PCIe link verification, thermal/power throttling, XGMI link errors</li>
+                    <li>Storage I/O profiling - NVMe detection, RAID configuration, GPU Direct Storage capability</li>
+                    <li>Network performance testing - RDMA/RoCE detection, MPI benchmarks, bandwidth tools</li>
                     <li>Enhanced error handling with JSON validation and crash protection</li>
                     <li>Metadata tracking (_metadata section) with collection status and error logging</li>
                     <li>Support for both old and new amd-smi JSON formats</li>

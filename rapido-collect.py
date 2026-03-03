@@ -2459,6 +2459,85 @@ def gather_rocm_details() -> Dict[str, List[Dict[str, str]]]:
     if len(kernel_info) > 1:
         rocm_info_list.append(kernel_info)
 
+    rocm_smi_showall = OrderedDict()
+    rocm_smi_showall["Section"] = "rocm-smi --showall"
+    
+    showall_output = run_command(["rocm-smi", "--showall"])
+    if showall_output:
+        lines = showall_output.strip().splitlines()
+        current_gpu = None
+        gpu_data = {}
+        
+        for line in lines:
+            line = line.strip()
+            if not line or line.startswith("="):
+                continue
+            
+            if line.startswith("GPU["):
+                if current_gpu and gpu_data:
+                    rocm_smi_showall[current_gpu] = str(gpu_data)
+                    gpu_data = {}
+                current_gpu = line.split("]")[0] + "]"
+            elif ":" in line and current_gpu:
+                key, value = line.split(":", 1)
+                gpu_data[key.strip()] = value.strip()
+        
+        if current_gpu and gpu_data:
+            rocm_smi_showall[current_gpu] = str(gpu_data)
+    
+    if len(rocm_smi_showall) > 1:
+        rocm_info_list.append(rocm_smi_showall)
+
+    rocm_smi_showinfo = OrderedDict()
+    rocm_smi_showinfo["Section"] = "rocm-smi --showinfo"
+    
+    showinfo_output = run_command(["rocm-smi", "--showinfo"])
+    if showinfo_output:
+        lines = showinfo_output.strip().splitlines()
+        current_gpu = None
+        gpu_data = {}
+        
+        for line in lines:
+            line = line.strip()
+            if not line or line.startswith("="):
+                continue
+            
+            if line.startswith("GPU["):
+                if current_gpu and gpu_data:
+                    rocm_smi_showinfo[current_gpu] = str(gpu_data)
+                    gpu_data = {}
+                current_gpu = line.split("]")[0] + "]"
+            elif ":" in line and current_gpu:
+                key, value = line.split(":", 1)
+                gpu_data[key.strip()] = value.strip()
+        
+        if current_gpu and gpu_data:
+            rocm_smi_showinfo[current_gpu] = str(gpu_data)
+    
+    if len(rocm_smi_showinfo) > 1:
+        rocm_info_list.append(rocm_smi_showinfo)
+
+    smc_version_info = OrderedDict()
+    smc_version_info["Section"] = "SMC Version Information"
+    
+    smc_output = run_command(["rocm-smi", "--showfwinfo"])
+    if smc_output:
+        lines = smc_output.strip().splitlines()
+        for line in lines:
+            line = line.strip()
+            if "SMC" in line.upper() and ":" in line:
+                key, value = line.split(":", 1)
+                smc_version_info[key.strip()] = value.strip()
+            elif line.startswith("GPU[") and "SMC" in line.upper():
+                parts = line.split()
+                for i, part in enumerate(parts):
+                    if "SMC" in part.upper() and i + 1 < len(parts):
+                        gpu_id = line.split("]")[0] + "]"
+                        smc_version_info[f"{gpu_id} SMC Version"] = parts[i + 1]
+    
+    if len(smc_version_info) > 1:
+        rocm_info_list.append(smc_version_info)
+
     if rocm_info_list:
         details["linux"] = rocm_info_list
 
@@ -2621,10 +2700,12 @@ def main() -> None:
     
     # Add collection metadata
     import datetime
+    import sys
     payload["_metadata"] = {
         "collection_date": datetime.datetime.now().isoformat(),
         "collection_status": "partial" if collection_errors else "complete",
-        "errors": collection_errors if collection_errors else []
+        "errors": collection_errors if collection_errors else [],
+        "command_line": ' '.join(sys.argv)
     }
     
     payload["cpu"] = cpu_details
