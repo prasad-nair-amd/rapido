@@ -20,7 +20,7 @@ def run_command(cmd):
             cmd,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
-            text=True,
+            universal_newlines=True,
             timeout=60
         )
         return result.stdout if result.returncode == 0 else None

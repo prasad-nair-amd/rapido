@@ -1,10 +1,103 @@
 #!/usr/bin/env python3
 import argparse
+import hashlib
 import json
 import sys
 from html import escape
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
+
+# Keys used to pair corresponding items between two JSON files (order matters).
+_ITEM_PAIR_KEYS: Tuple[str, ...] = ("Section", "Name", "Interface", "Adapter")
+
+
+def _tab_button_html(tab_id: str, label: str, first_tab: str, has: bool) -> str:
+    """Build a tab button; separate from the main f-string template to avoid backslashes in nested f-expressions."""
+    if not has:
+        return ""
+    active = " active" if first_tab == tab_id else ""
+    return (
+        f'<button class="tab{active}" onclick="openTab(event, \'{tab_id}\')" '
+        f'draggable="true" data-tab="{tab_id}">{label}</button>'
+    )
+
+
+def _item_pair_key(item: Any) -> str:
+    """Stable string key to match list items between two reports."""
+    if isinstance(item, dict):
+        for k in _ITEM_PAIR_KEYS:
+            if k in item and item[k] is not None:
+                return f"{k}:{item[k]!s}"
+        try:
+            blob = json.dumps(item, sort_keys=True, default=str)
+            h = hashlib.md5(blob.encode("utf-8")).hexdigest()[:16]
+            return f"__content:{h}"
+        except Exception:
+            return "__empty__"
+    return f"__other:{item!s}"
+
+
+def _strip_section_field(item: Dict[str, Any]) -> Dict[str, Any]:
+    return {k: v for k, v in item.items() if k != "Section"}
+
+
+def _canonical_equal(a: Any, b: Any) -> bool:
+    """Deep equality suitable for JSON-like structures (sorted keys for dicts)."""
+    if type(a) is not type(b):
+        # Allow int/float equivalence
+        if isinstance(a, (int, float)) and isinstance(b, (int, float)):
+            return float(a) == float(b)
+        return False
+    if isinstance(a, dict):
+        if set(a.keys()) != set(b.keys()):
+            return False
+        return all(_canonical_equal(a[k], b[k]) for k in sorted(a.keys()))
+    if isinstance(a, list):
+        if len(a) != len(b):
+            return False
+        return all(_canonical_equal(x, y) for x, y in zip(a, b))
+    return a == b
+
+
+def _pair_section_items(items1: List[Any], items2: List[Any]) -> List[Tuple[Optional[Dict[str, Any]], Optional[Dict[str, Any]]]]:
+    """
+    Pair dict items from two lists by _item_pair_key (FIFO when duplicate keys).
+    Unmatched items pair with None. Non-dict entries are paired by order at the end.
+    """
+    from collections import defaultdict
+
+    queues: Dict[str, List[Dict[str, Any]]] = defaultdict(list)
+    nondict2: List[Any] = []
+    for it in items2:
+        if isinstance(it, dict):
+            queues[_item_pair_key(it)].append(it)
+        else:
+            nondict2.append(it)
+
+    pairs: List[Tuple[Optional[Dict[str, Any]], Optional[Dict[str, Any]]]] = []
+    nondict1: List[Any] = []
+    for it in items1:
+        if isinstance(it, dict):
+            k = _item_pair_key(it)
+            if queues.get(k):
+                pairs.append((it, queues[k].pop(0)))
+            else:
+                pairs.append((it, None))
+        else:
+            nondict1.append(it)
+
+    for k, q in queues.items():
+        for rest in q:
+            pairs.append((None, rest))
+
+    for a, b in zip(nondict1, nondict2):
+        pairs.append(({"__scalar__": a}, {"__scalar__": b}))
+    for extra in nondict1[len(nondict2) :]:
+        pairs.append(({"__scalar__": extra}, None))
+    for extra in nondict2[len(nondict1) :]:
+        pairs.append((None, {"__scalar__": extra}))
+
+    return pairs
 
 
 def _render_dict_as_table(data: Dict[str, Any]) -> str:
@@ -56,7 +149,160 @@ def _value_to_html(value: Any) -> str:
     if isinstance(value, list):
         items = "".join(f"<li>{_value_to_html(item)}</li>" for item in value)
         return "<ul>" + items + "</ul>"
+    if value is None:
+        return escape("None")
     return escape(str(value))
+
+
+def _scalar_diff_fragment(value: Any) -> str:
+    if value is None:
+        return "<span class='diff-absent'>—</span>"
+    return escape(str(value))
+
+
+def _diff_cell_pair_for_value(left: Any, right: Any) -> Tuple[str, str]:
+    """Return (html_left, html_right) for one logical field, with diff highlighting."""
+    if isinstance(left, dict) and isinstance(right, dict):
+        tl, tr = _render_dict_tables_diff(left, right)
+        return (tl, tr)
+    if isinstance(left, dict) or isinstance(right, dict):
+        return (
+            f"<span class='diff-cell diff-changed'>{_value_to_html(left) if left is not None else _scalar_diff_fragment(None)}</span>",
+            f"<span class='diff-cell diff-changed'>{_value_to_html(right) if right is not None else _scalar_diff_fragment(None)}</span>",
+        )
+    if isinstance(left, list) and isinstance(right, list):
+        if _canonical_equal(left, right):
+            inner = _value_to_html(left)
+            return (
+                f"<span class='diff-cell diff-same'>{inner}</span>",
+                f"<span class='diff-cell diff-same'>{inner}</span>",
+            )
+        return (
+            f"<span class='diff-cell diff-changed'>{_value_to_html(left)}</span>",
+            f"<span class='diff-cell diff-changed'>{_value_to_html(right)}</span>",
+        )
+    if isinstance(left, list) or isinstance(right, list):
+        return (
+            f"<span class='diff-cell diff-changed'>{_value_to_html(left)}</span>",
+            f"<span class='diff-cell diff-changed'>{_value_to_html(right)}</span>",
+        )
+    if left is None and right is None:
+        s = "<span class='diff-cell diff-same'>—</span>"
+        return (s, s)
+    if left is None or right is None:
+        return (
+            f"<span class='diff-cell diff-changed'>{_scalar_diff_fragment(left)}</span>",
+            f"<span class='diff-cell diff-changed'>{_scalar_diff_fragment(right)}</span>",
+        )
+    if _canonical_equal(left, right):
+        inner = escape(str(left))
+        return (f"<span class='diff-cell diff-same'>{inner}</span>", f"<span class='diff-cell diff-same'>{inner}</span>")
+    return (
+        f"<span class='diff-cell diff-changed'>{escape(str(left))}</span>",
+        f"<span class='diff-cell diff-changed'>{escape(str(right))}</span>",
+    )
+
+
+def _render_dict_tables_diff(
+    left: Optional[Dict[str, Any]], right: Optional[Dict[str, Any]]
+) -> Tuple[str, str]:
+    """Pair of HTML tables with per-cell diff classes (same key order on both sides)."""
+    ld = left or {}
+    rd = right or {}
+    keys = sorted(set(ld.keys()) | set(rd.keys()))
+    rows_l: List[str] = []
+    rows_r: List[str] = []
+    for key in keys:
+        hl, hr = _diff_cell_pair_for_value(ld.get(key), rd.get(key))
+        rows_l.append(f"<tr><th>{escape(str(key))}</th><td>{hl}</td></tr>")
+        rows_r.append(f"<tr><th>{escape(str(key))}</th><td>{hr}</td></tr>")
+    return (
+        "<table class='info-table diff-table'>" + "".join(rows_l) + "</table>",
+        "<table class='info-table diff-table'>" + "".join(rows_r) + "</table>",
+    )
+
+
+def _card_header_title(item: Optional[Dict[str, Any]], title: str, idx: int) -> str:
+    if not item:
+        return f"{title} (unmatched)"
+    if "__scalar__" in item and len(item) == 1:
+        return str(item["__scalar__"])
+    return str(
+        item.get("Section")
+        or item.get("Name")
+        or item.get("Interface")
+        or item.get("Adapter")
+        or f"{title} {idx + 1}"
+    )
+
+
+def _render_list_as_cards_diff(items1: List[Any], items2: List[Any], title: str) -> str:
+    """Side-by-side cards with row-level diff highlighting for paired items."""
+    pairs = _pair_section_items(items1, items2)
+    if not pairs:
+        return "<p class='no-data'>No data available</p>"
+
+    blocks: List[str] = []
+    for idx, (left, right) in enumerate(pairs):
+        header_l = _card_header_title(left if isinstance(left, dict) else None, title, idx)
+        header_r = _card_header_title(right if isinstance(right, dict) else None, title, idx)
+
+        if left is None and right is not None:
+            body_r = _render_dict_as_table(_strip_section_field(right)) if isinstance(right, dict) else _value_to_html(right)
+            blocks.append(
+                "<div class='comparison-pair'>"
+                "<div class='comparison-column diff-column'>"
+                "<div class='card card-diff-unpaired'><div class='card-header card-diff-missing-side'>"
+                f"{escape(header_l)}</div>"
+                "<div class='card-body'><p class='diff-unpaired-note'>No matching entry in File 1</p></div></div></div>"
+                "<div class='comparison-column diff-column'>"
+                f"<div class='card card-diff-only-right'><div class='card-header'>{escape(header_r)}</div>"
+                f"<div class='card-body'>{body_r}</div></div>"
+                "</div></div>"
+            )
+            continue
+        if right is None and left is not None:
+            body_l = _render_dict_as_table(_strip_section_field(left)) if isinstance(left, dict) else _value_to_html(left)
+            blocks.append(
+                "<div class='comparison-pair'>"
+                "<div class='comparison-column diff-column'>"
+                f"<div class='card card-diff-only-left'><div class='card-header'>{escape(header_l)}</div>"
+                f"<div class='card-body'>{body_l}</div></div></div>"
+                "<div class='comparison-column diff-column'>"
+                "<div class='card card-diff-unpaired'><div class='card-header card-diff-missing-side'>"
+                f"{escape(header_r)}</div>"
+                "<div class='card-body'><p class='diff-unpaired-note'>No matching entry in File 2</p></div></div>"
+                "</div></div>"
+            )
+            continue
+
+        if not isinstance(left, dict) or not isinstance(right, dict):
+            blocks.append(
+                "<div class='comparison-pair'>"
+                "<div class='comparison-column diff-column'>"
+                f"<div class='card'><div class='card-body'>{_value_to_html(left)}</div></div></div>"
+                "<div class='comparison-column diff-column'>"
+                f"<div class='card'><div class='card-body'>{_value_to_html(right)}</div></div></div>"
+                "</div>"
+            )
+            continue
+
+        tl, tr = _render_dict_tables_diff(_strip_section_field(left), _strip_section_field(right))
+        pair_cls = "comparison-pair"
+        if not _canonical_equal(_strip_section_field(left), _strip_section_field(right)):
+            pair_cls += " comparison-pair-changed"
+        blocks.append(
+            f"<div class='{pair_cls}'>"
+            "<div class='comparison-column diff-column'>"
+            f"<div class='card'><div class='card-header'>{escape(header_l)}</div>"
+            f"<div class='card-body'>{tl}</div></div></div>"
+            "<div class='comparison-column diff-column'>"
+            f"<div class='card'><div class='card-header'>{escape(header_r)}</div>"
+            f"<div class='card-body'>{tr}</div></div>"
+            "</div></div>"
+        )
+
+    return "".join(blocks)
 
 
 def _extract_section_data(data: Dict[str, Any], section: str) -> List[Dict[str, Any]]:
@@ -79,23 +325,22 @@ def _extract_section_data(data: Dict[str, Any], section: str) -> List[Dict[str, 
 
 def _render_comparison_section(data1: Optional[Dict[str, Any]], data2: Optional[Dict[str, Any]],
                                 section: str, section_title: str) -> str:
-    """Render a comparison section with two files side by side."""
+    """Render a comparison section with paired cards and per-field diff highlighting."""
     file1_items = _extract_section_data(data1, section) if data1 else []
     file2_items = _extract_section_data(data2, section) if data2 else []
 
-    file1_html = _render_list_as_cards(file1_items, section_title) if file1_items else "<p class='no-data'>No data available</p>"
-    file2_html = _render_list_as_cards(file2_items, section_title) if file2_items else "<p class='no-data'>No data available</p>"
+    if not file1_items and not file2_items:
+        return "<p class='no-data'>No data available</p>"
+
+    diff_body = _render_list_as_cards_diff(file1_items, file2_items, section_title)
 
     return (
-        "<div class='comparison-container'>"
-        "<div class='comparison-column'>"
-        f"<h3>File 1</h3>"
-        f"{file1_html}"
+        "<div class='comparison-diff-wrap'>"
+        "<div class='comparison-file-labels'>"
+        "<div class='comparison-file-label'><h3>File 1</h3></div>"
+        "<div class='comparison-file-label'><h3>File 2</h3></div>"
         "</div>"
-        "<div class='comparison-column'>"
-        f"<h3>File 2</h3>"
-        f"{file2_html}"
-        "</div>"
+        f"{diff_body}"
         "</div>"
     )
 
@@ -450,6 +695,136 @@ def generate_comparison_html(file1_path: Optional[Path], file2_path: Optional[Pa
             border-bottom: 2px solid #667eea;
         }}
 
+        .comparison-diff-wrap {{
+            width: 100%;
+        }}
+
+        .diff-legend {{
+            font-size: 0.9rem;
+            color: #495057;
+            background: #f8f9fa;
+            border: 1px solid #dee2e6;
+            border-radius: 6px;
+            padding: 10px 14px;
+            margin-bottom: 16px;
+            line-height: 1.5;
+        }}
+
+        .header .diff-legend {{
+            margin: 18px auto 0;
+            max-width: 900px;
+            text-align: left;
+            color: #212529;
+            background: rgba(255, 255, 255, 0.95);
+            border-color: rgba(0, 0, 0, 0.08);
+        }}
+
+        .diff-legend-swatch {{
+            display: inline-block;
+            padding: 2px 8px;
+            border-radius: 4px;
+            margin: 0 4px;
+            font-size: 0.85rem;
+            font-weight: 600;
+        }}
+
+        .diff-legend-changed {{
+            background: #fff3cd;
+            border: 1px solid #ffc107;
+            color: #856404;
+        }}
+
+        .diff-legend-same {{
+            background: #d4edda;
+            border: 1px solid #28a745;
+            color: #155724;
+        }}
+
+        .diff-legend-absent {{
+            background: #e2e3e5;
+            border: 1px solid #adb5bd;
+            color: #383d41;
+        }}
+
+        .comparison-file-labels {{
+            display: grid;
+            grid-template-columns: 1fr 1fr;
+            gap: 20px;
+            margin-bottom: 12px;
+        }}
+
+        .comparison-file-label h3 {{
+            color: #495057;
+            margin: 0;
+            padding-bottom: 8px;
+            border-bottom: 2px solid #667eea;
+        }}
+
+        .comparison-pair {{
+            display: grid;
+            grid-template-columns: 1fr 1fr;
+            gap: 20px;
+            align-items: start;
+            margin-bottom: 20px;
+        }}
+
+        .comparison-pair-changed .card {{
+            box-shadow: 0 0 0 2px rgba(255, 193, 7, 0.35);
+        }}
+
+        .diff-column {{
+            min-width: 0;
+        }}
+
+        .diff-table td .diff-table {{
+            margin-top: 6px;
+            font-size: 0.95em;
+        }}
+
+        .diff-cell {{
+            display: inline-block;
+            width: 100%;
+        }}
+
+        .diff-cell.diff-changed {{
+            background: #fff8e1;
+            border-radius: 4px;
+            padding: 4px 6px;
+            box-shadow: inset 0 0 0 1px rgba(255, 193, 7, 0.45);
+        }}
+
+        .diff-cell.diff-same {{
+            border-radius: 4px;
+            padding: 2px 4px;
+        }}
+
+        .diff-absent {{
+            color: #6c757d;
+            font-weight: 600;
+        }}
+
+        .card-diff-only-left {{
+            border-left: 4px solid #fd7e14;
+        }}
+
+        .card-diff-only-right {{
+            border-left: 4px solid #0d6efd;
+        }}
+
+        .card-diff-unpaired {{
+            opacity: 0.95;
+        }}
+
+        .card-diff-missing-side {{
+            background: #6c757d !important;
+        }}
+
+        .diff-unpaired-note {{
+            margin: 0;
+            color: #6c757d;
+            font-style: italic;
+        }}
+
         .card {{
             background: white;
             border: 1px solid #e0e0e0;
@@ -521,6 +896,11 @@ def generate_comparison_html(file1_path: Optional[Path], file2_path: Optional[Pa
                 grid-template-columns: 1fr;
             }}
 
+            .comparison-file-labels,
+            .comparison-pair {{
+                grid-template-columns: 1fr;
+            }}
+
             .tabs {{
                 overflow-x: auto;
             }}
@@ -539,6 +919,7 @@ def generate_comparison_html(file1_path: Optional[Path], file2_path: Optional[Pa
                 <div class="file-info"><strong>File 1:</strong> {escape(file1_name)}</div>
                 <div class="file-info"><strong>File 2:</strong> {escape(file2_name)}</div>
             </div>''' if is_comparison else f'<div class="file-names"><div class="file-info">{escape(file1_name or file2_name)}</div></div>'}
+            {f'''<div class="diff-legend" role="note"><strong>Diff view:</strong> <span class="diff-legend-swatch diff-legend-changed">Changed</span> <span class="diff-legend-swatch diff-legend-same">Same</span> <span class="diff-legend-swatch diff-legend-absent">Missing</span> · Cards are matched by Section / Name / Interface / Adapter when present.</div>''' if is_comparison else ''}
             {f'''<div class="command-toggle" onclick="toggleCommand()">▼ Show collection command{"s" if is_comparison else ""}</div>
             <div class="command-section" id="commandSection">
                 {f'<div style="margin-bottom: 10px;"><strong>File 1 Collection:</strong></div><div class="command-box">{escape(command_line1)}</div>' if command_line1 else ''}
@@ -547,12 +928,12 @@ def generate_comparison_html(file1_path: Optional[Path], file2_path: Optional[Pa
         </div>
 
         <div class="tabs" id="tabs-container">
-            {f'<button class="tab{" active" if first_tab == "cpu" else ""}" onclick="openTab(event, \'cpu\')" draggable="true" data-tab="cpu">CPU</button>' if has_cpu else ''}
-            {f'<button class="tab{" active" if first_tab == "gpu" else ""}" onclick="openTab(event, \'gpu\')" draggable="true" data-tab="gpu">GPU</button>' if has_gpu else ''}
-            {f'<button class="tab{" active" if first_tab == "rocm" else ""}" onclick="openTab(event, \'rocm\')" draggable="true" data-tab="rocm">ROCm</button>' if has_rocm else ''}
-            {f'<button class="tab{" active" if first_tab == "network" else ""}" onclick="openTab(event, \'network\')" draggable="true" data-tab="network">Network</button>' if has_network else ''}
-            {f'<button class="tab{" active" if first_tab == "bmc" else ""}" onclick="openTab(event, \'bmc\')" draggable="true" data-tab="bmc">BMC</button>' if has_bmc else ''}
-            {f'<button class="tab{" active" if first_tab == "microbenchmarks" else ""}" onclick="openTab(event, \'microbenchmarks\')" draggable="true" data-tab="microbenchmarks">Microbenchmarks</button>' if has_microbenchmarks else ''}
+            {_tab_button_html("cpu", "CPU", first_tab, has_cpu)}
+            {_tab_button_html("gpu", "GPU", first_tab, has_gpu)}
+            {_tab_button_html("rocm", "ROCm", first_tab, has_rocm)}
+            {_tab_button_html("network", "Network", first_tab, has_network)}
+            {_tab_button_html("bmc", "BMC", first_tab, has_bmc)}
+            {_tab_button_html("microbenchmarks", "Microbenchmarks", first_tab, has_microbenchmarks)}
         </div>
 
         {f'<div id="cpu" class="tab-content{" active" if first_tab == "cpu" else ""}">{cpu_content}</div>' if has_cpu else ''}

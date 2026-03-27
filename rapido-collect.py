@@ -1,4 +1,4 @@
-﻿#!/usr/bin/env python3
+#!/usr/bin/env python3
 import argparse
 import json
 import os
@@ -9,14 +9,14 @@ import sys
 from collections import OrderedDict
 from typing import Dict, List, Optional
 
-def run_command(cmd: list[str]) -> Optional[str]:
+def run_command(cmd: List[str]) -> Optional[str]:
     try:
         result = subprocess.run(
             cmd,
             check=True,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
-            text=True,
+            universal_newlines=True,  # Python 3.6 compatible; use text=True on 3.7+
         )
         return result.stdout.strip()
     except (subprocess.SubprocessError, FileNotFoundError):
