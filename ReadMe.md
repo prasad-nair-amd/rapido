@@ -61,12 +61,18 @@ sudo python3 rapido-collect.py -a -p -v
 # Single server report
 python3 rapido-report.py -f1 serverinfo_server1.json -o report.html
 
-# Side-by-side comparison of two servers
+# Side-by-side comparison of two servers (differences highlighted in yellow)
 python3 rapido-report.py -f1 serverinfo_server1.json -f2 serverinfo_server2.json -o comparison.html
 
 # Legacy single file mode
 python3 rapido-report.py -i serverinfo_server1.json -o report.html
 ```
+
+**Comparison Report Features**:
+- Side-by-side layout for easy visual comparison
+- **Yellow highlighting** automatically applied to fields with different values
+- Intelligent matching of corresponding components (GPUs, network interfaces, etc.)
+- Works across all sections: CPU, GPU, ROCm, Network, BMC, and Microbenchmarks
 
 ### GPU Benchmarks
 ```bash
@@ -184,17 +190,30 @@ hipcc -o gpu_topology gpu_topology.cpp
 
 **Data extraction**: `_extract_section_data(data, section)` - Flattens nested OS-specific data structures
 
+**Difference detection**: `_values_differ(value1, value2)` - Intelligently compares values
+- Handles None values and type differences
+- Extracts and compares numeric values from formatted strings (e.g., "16 GB", "3.5 GHz")
+- Falls back to normalized string comparison
+
 **Rendering functions**:
-- `_render_dict_as_table(data)`: Converts dict to HTML table
-- `_render_list_as_cards(items)`: Creates card UI for each item (uses "Section" field for title)
-- `_render_comparison_section()`: Side-by-side layout for two files
+- `_render_dict_as_table(data, comparison_data)`: Converts dict to HTML table with optional difference highlighting
+- `_render_list_as_cards(items, comparison_items)`: Creates card UI with intelligent component matching
+- `_render_comparison_section()`: Side-by-side layout with cross-comparison highlighting
 - `_render_single_section()`: Single file layout
+- `_value_to_html(value, comparison_value)`: Recursively converts data structures, preserving comparison context
+
+**Comparison logic**:
+- Matches corresponding cards by identifier (Section, Name, Interface, Adapter fields)
+- Falls back to index-based matching when identifier matching fails
+- Applies `highlight-diff` CSS class (yellow background) to differing values
+- Works recursively through nested dictionaries and lists
 
 **HTML output**: 
 - Tabbed interface (CPU, GPU, ROCm, Network, BMC*, Microbenchmarks*)
 - Tabs are draggable/reorderable with localStorage persistence
 - Conditional BMC and Microbenchmarks tabs based on data availability
 - Gradient purple theme with responsive design
+- **Yellow highlighting** (`#fff9c4` background) for differences in comparison mode
 
 ### gpu_p2p_bandwidth.cpp (HIP benchmark)
 **Purpose**: Measures GPU-to-GPU communication bandwidth

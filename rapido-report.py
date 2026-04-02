@@ -7,23 +7,32 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 
-def _render_dict_as_table(data: Dict[str, Any]) -> str:
-    """Render a dictionary as an HTML table."""
+def _render_dict_as_table(data: Dict[str, Any], comparison_data: Optional[Dict[str, Any]] = None) -> str:
+    """Render a dictionary as an HTML table, highlighting differences if comparison data provided."""
     rows = []
     for key, value in data.items():
+        # Check if this value differs from comparison data
+        is_different = False
+        if comparison_data is not None:
+            comp_value = comparison_data.get(key)
+            is_different = _values_differ(value, comp_value)
+
+        highlight_class = ' class="highlight-diff"' if is_different else ''
+
         if isinstance(value, (dict, list)):
+            comp_nested = comparison_data.get(key) if comparison_data else None
             rows.append(
-                f"<tr><th>{escape(str(key))}</th><td>{_value_to_html(value)}</td></tr>"
+                f"<tr><th>{escape(str(key))}</th><td{highlight_class}>{_value_to_html(value, comp_nested)}</td></tr>"
             )
         else:
             rows.append(
-                f"<tr><th>{escape(str(key))}</th><td>{escape(str(value))}</td></tr>"
+                f"<tr><th>{escape(str(key))}</th><td{highlight_class}>{escape(str(value))}</td></tr>"
             )
     return "<table class='info-table'>" + "".join(rows) + "</table>"
 
 
-def _render_list_as_cards(items: List[Any], title: str = "") -> str:
-    """Render a list of dictionaries as cards."""
+def _render_list_as_cards(items: List[Any], title: str = "", comparison_items: Optional[List[Any]] = None) -> str:
+    """Render a list of dictionaries as cards, optionally comparing with another list."""
     if not items:
         return "<p class='no-data'>No data available</p>"
 
@@ -36,7 +45,22 @@ def _render_list_as_cards(items: List[Any], title: str = "") -> str:
             # Create a copy of the item without the Section field for display
             display_item = {k: v for k, v in item.items() if k != "Section"}
 
-            card_content = _render_dict_as_table(display_item)
+            # Find matching comparison item by card_title or index
+            comparison_item = None
+            if comparison_items:
+                # Try to match by the same identifier
+                for comp_item in comparison_items:
+                    if isinstance(comp_item, dict):
+                        comp_title = comp_item.get("Section") or comp_item.get("Name") or comp_item.get("Interface") or comp_item.get("Adapter")
+                        if comp_title == card_title:
+                            comparison_item = {k: v for k, v in comp_item.items() if k != "Section"}
+                            break
+                # Fallback to index-based matching
+                if comparison_item is None and idx < len(comparison_items):
+                    if isinstance(comparison_items[idx], dict):
+                        comparison_item = {k: v for k, v in comparison_items[idx].items() if k != "Section"}
+
+            card_content = _render_dict_as_table(display_item, comparison_item)
             cards.append(
                 f"<div class='card'>"
                 f"<div class='card-header'>{escape(str(card_title))}</div>"
@@ -49,13 +73,43 @@ def _render_list_as_cards(items: List[Any], title: str = "") -> str:
     return "".join(cards)
 
 
-def _value_to_html(value: Any) -> str:
+def _values_differ(value1: Any, value2: Any) -> bool:
+    """Check if two values are different, handling various data types."""
+    if value1 is None and value2 is None:
+        return False
+    if value1 is None or value2 is None:
+        return True
+
+    # Normalize string comparison (handle different types)
+    str1 = str(value1).strip()
+    str2 = str(value2).strip()
+
+    # For numeric comparisons, try to compare as numbers
+    try:
+        # Extract numbers from strings like "16 GB" or "3.5 GHz"
+        import re
+        num1 = re.findall(r'[-+]?\d*\.?\d+', str1)
+        num2 = re.findall(r'[-+]?\d*\.?\d+', str2)
+        if num1 and num2:
+            return num1 != num2
+    except:
+        pass
+
+    return str1 != str2
+
+
+def _value_to_html(value: Any, comparison_value: Any = None) -> str:
     """Recursively convert Python data structures to HTML fragments."""
     if isinstance(value, dict):
-        return _render_dict_as_table(value)
+        comp_dict = comparison_value if isinstance(comparison_value, dict) else None
+        return _render_dict_as_table(value, comp_dict)
     if isinstance(value, list):
-        items = "".join(f"<li>{_value_to_html(item)}</li>" for item in value)
-        return "<ul>" + items + "</ul>"
+        comp_list = comparison_value if isinstance(comparison_value, list) else None
+        items = []
+        for idx, item in enumerate(value):
+            comp_item = comp_list[idx] if comp_list and idx < len(comp_list) else None
+            items.append(f"<li>{_value_to_html(item, comp_item)}</li>")
+        return "<ul>" + "".join(items) + "</ul>"
     return escape(str(value))
 
 
@@ -79,12 +133,13 @@ def _extract_section_data(data: Dict[str, Any], section: str) -> List[Dict[str, 
 
 def _render_comparison_section(data1: Optional[Dict[str, Any]], data2: Optional[Dict[str, Any]],
                                 section: str, section_title: str) -> str:
-    """Render a comparison section with two files side by side."""
+    """Render a comparison section with two files side by side, highlighting differences."""
     file1_items = _extract_section_data(data1, section) if data1 else []
     file2_items = _extract_section_data(data2, section) if data2 else []
 
-    file1_html = _render_list_as_cards(file1_items, section_title) if file1_items else "<p class='no-data'>No data available</p>"
-    file2_html = _render_list_as_cards(file2_items, section_title) if file2_items else "<p class='no-data'>No data available</p>"
+    # Render with cross-comparison for highlighting
+    file1_html = _render_list_as_cards(file1_items, section_title, file2_items) if file1_items else "<p class='no-data'>No data available</p>"
+    file2_html = _render_list_as_cards(file2_items, section_title, file1_items) if file2_items else "<p class='no-data'>No data available</p>"
 
     return (
         "<div class='comparison-container'>"
@@ -500,6 +555,11 @@ def generate_comparison_html(file1_path: Optional[Path], file2_path: Optional[Pa
             border-bottom: none;
         }}
 
+        .highlight-diff {{
+            background-color: #fff9c4;
+            font-weight: 500;
+        }}
+
         .no-data {{
             text-align: center;
             padding: 40px;
@@ -547,12 +607,12 @@ def generate_comparison_html(file1_path: Optional[Path], file2_path: Optional[Pa
         </div>
 
         <div class="tabs" id="tabs-container">
-            {f'<button class="tab{" active" if first_tab == "cpu" else ""}" onclick="openTab(event, \'cpu\')" draggable="true" data-tab="cpu">CPU</button>' if has_cpu else ''}
-            {f'<button class="tab{" active" if first_tab == "gpu" else ""}" onclick="openTab(event, \'gpu\')" draggable="true" data-tab="gpu">GPU</button>' if has_gpu else ''}
-            {f'<button class="tab{" active" if first_tab == "rocm" else ""}" onclick="openTab(event, \'rocm\')" draggable="true" data-tab="rocm">ROCm</button>' if has_rocm else ''}
-            {f'<button class="tab{" active" if first_tab == "network" else ""}" onclick="openTab(event, \'network\')" draggable="true" data-tab="network">Network</button>' if has_network else ''}
-            {f'<button class="tab{" active" if first_tab == "bmc" else ""}" onclick="openTab(event, \'bmc\')" draggable="true" data-tab="bmc">BMC</button>' if has_bmc else ''}
-            {f'<button class="tab{" active" if first_tab == "microbenchmarks" else ""}" onclick="openTab(event, \'microbenchmarks\')" draggable="true" data-tab="microbenchmarks">Microbenchmarks</button>' if has_microbenchmarks else ''}
+            {f'<button class="tab{" active" if first_tab == "cpu" else ""}" onclick="openTab(event, ' + "'cpu'" + ')" draggable="true" data-tab="cpu">CPU</button>' if has_cpu else ''}
+            {f'<button class="tab{" active" if first_tab == "gpu" else ""}" onclick="openTab(event, ' + "'gpu'" + ')" draggable="true" data-tab="gpu">GPU</button>' if has_gpu else ''}
+            {f'<button class="tab{" active" if first_tab == "rocm" else ""}" onclick="openTab(event, ' + "'rocm'" + ')" draggable="true" data-tab="rocm">ROCm</button>' if has_rocm else ''}
+            {f'<button class="tab{" active" if first_tab == "network" else ""}" onclick="openTab(event, ' + "'network'" + ')" draggable="true" data-tab="network">Network</button>' if has_network else ''}
+            {f'<button class="tab{" active" if first_tab == "bmc" else ""}" onclick="openTab(event, ' + "'bmc'" + ')" draggable="true" data-tab="bmc">BMC</button>' if has_bmc else ''}
+            {f'<button class="tab{" active" if first_tab == "microbenchmarks" else ""}" onclick="openTab(event, ' + "'microbenchmarks'" + ')" draggable="true" data-tab="microbenchmarks">Microbenchmarks</button>' if has_microbenchmarks else ''}
         </div>
 
         {f'<div id="cpu" class="tab-content{" active" if first_tab == "cpu" else ""}">{cpu_content}</div>' if has_cpu else ''}

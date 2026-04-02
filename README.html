@@ -263,6 +263,7 @@
             <div class="success-box">
                 <strong>Latest Enhancements:</strong>
                 <ul>
+                    <li><strong>Yellow Difference Highlighting</strong> - Comparison reports now automatically highlight fields with different values using a yellow background for instant visual identification</li>
                     <li><strong>Selective Data Collection</strong> - New flags (-c, -g, -n, -b, -r, -m) to collect specific hardware sections only, reducing collection time</li>
                     <li><strong>Dynamic Tab Visibility</strong> - Report tabs now only appear when data is available, providing cleaner UI</li>
                     <li><strong>Conditional Report Titles</strong> - Report title shows "Comparison" only when comparing two devices</li>
@@ -326,8 +327,8 @@
                     <p>Automatic detection of all required and optional tools at startup with clear reporting of missing tools and their impact on report sections.</p>
                 </div>
                 <div class="feature-card">
-                    <h4>Side-by-Side Comparison</h4>
-                    <p>Compare two servers with interactive tabbed interface and visual differences highlighting.</p>
+                    <h4>Side-by-Side Comparison <span class="new-badge">ENHANCED</span></h4>
+                    <p>Compare two servers with interactive tabbed interface and automatic yellow highlighting of differences. Intelligent component matching ensures accurate field-by-field comparisons.</p>
                 </div>
             </div>
 
@@ -457,11 +458,15 @@ hipcc -O3 -o gpu_kernel_benchmarks gpu_kernel_benchmarks.cpp
 
             <h4>Compare Two Servers</h4>
             <div class="code-block">
-<span class="comment"># Compare two servers side-by-side</span>
+<span class="comment"># Compare two servers side-by-side with automatic difference highlighting</span>
 <span class="command">python3</span> rapido-report.py \
     -f1 serverinfo_server1.json \
     -f2 serverinfo_server2.json \
     -o comparison_report.html
+            </div>
+
+            <div class="success-box">
+                <strong>Yellow Highlighting Feature:</strong> When comparing two servers, fields with different values are automatically highlighted with a <strong>yellow background</strong> for easy visual identification. This works across all tabs (CPU, GPU, Network, BMC, ROCm, Microbenchmarks) and intelligently matches corresponding components between servers.
             </div>
 
             <h4>Single Server Report</h4>
@@ -667,6 +672,8 @@ hipcc -O3 -o gpu_kernel_benchmarks gpu_kernel_benchmarks.cpp
                 <strong>Comparison Mode:</strong> When comparing two files, each tab displays data side-by-side
                 for easy visual comparison between systems. The report title will show "AMD Rapido Server Information Comparison".
                 For single-device reports, the title is "AMD Rapido Server Information".
+                <br><br>
+                <strong>Difference Highlighting:</strong> Fields with different values are automatically highlighted with a <strong>yellow background (#fff9c4)</strong> for instant visual identification. The comparison engine intelligently matches corresponding components (GPUs, network interfaces, etc.) by their identifiers and recursively compares nested data structures.
             </div>
 
             <div class="success-box">
@@ -1089,6 +1096,7 @@ done
             <div class="info-box">
                 <strong>Version 2.2</strong> (Current)
                 <ul>
+                    <li><strong>Yellow difference highlighting</strong> - Comparison reports automatically highlight fields with different values using yellow background</li>
                     <li>Selective data collection with flags: -c (CPU), -g (GPU), -n (Network), -b (BMC), -r (ROCm), -m (Microbenchmarks)</li>
                     <li>Dynamic tab visibility - tabs only appear when data is available</li>
                     <li>Conditional report titles - "Comparison" only shows when comparing two devices</li>
