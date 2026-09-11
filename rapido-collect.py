@@ -31,8 +31,28 @@ def _safe_hostname() -> str:
         return ""
 
 
+def _hip_runtime_env() -> Dict[str, str]:
+    """Environment for running a locally compiled HIP binary.
+
+    hipcc links against libamdhip64.so from the ROCm tree, but many installs never add
+    /opt/rocm/lib to the loader search path (no ld.so.conf.d entry, no LD_LIBRARY_PATH in
+    a non-login shell). The binary then dies with "libamdhip64.so.N: cannot open shared
+    object file" and every GPU benchmark silently reports no output. Prepending the ROCm
+    library directories here makes the benchmarks run regardless of shell setup.
+    """
+    env = dict(os.environ)
+    rocm_path = env.get("ROCM_PATH") or "/opt/rocm"
+    candidates = [os.path.join(rocm_path, "lib"), os.path.join(rocm_path, "lib64")]
+    libdirs = [d for d in candidates if os.path.isdir(d)]
+    if libdirs:
+        existing = env.get("LD_LIBRARY_PATH", "")
+        parts = libdirs + ([existing] if existing else [])
+        env["LD_LIBRARY_PATH"] = os.pathsep.join(parts)
+    return env
+
+
 def run_command(cmd: List[str], timeout: Optional[int] = DEFAULT_COMMAND_TIMEOUT,
-                record: bool = True) -> Optional[str]:
+                record: bool = True, env: Optional[Dict[str, str]] = None) -> Optional[str]:
     """Run an external command and return its stdout, or None on any failure.
 
     Failures are recorded in COMMAND_FAILURES with a reason so the caller (and ultimately the
@@ -40,7 +60,8 @@ def run_command(cmd: List[str], timeout: Optional[int] = DEFAULT_COMMAND_TIMEOUT
     for long-running work such as compiling or running the GPU benchmarks.
 
     Pass record=False for speculative probes (does this tool exist? does it accept --version?)
-    whose failure is expected and not worth surfacing in the report.
+    whose failure is expected and not worth surfacing in the report. Pass env to override the
+    child environment, e.g. _hip_runtime_env() for the compiled HIP benchmarks.
     """
     key = " ".join(cmd)
 
@@ -56,6 +77,7 @@ def run_command(cmd: List[str], timeout: Optional[int] = DEFAULT_COMMAND_TIMEOUT
             stderr=subprocess.PIPE,
             universal_newlines=True,  # text=True equivalent for Python 3.6 compatibility
             timeout=timeout,
+            env=env,
         )
         # A command that succeeds now supersedes any earlier failure of the same
         # command, so a stale record cannot outlive the condition it described.
@@ -1695,7 +1717,47 @@ def compute_peak_performance(gfx_version: Optional[str], compute_units: int,
     }
 
 
-def _build_p2p_matrix_card(pairs: List[Dict]) -> Optional[Dict]:
+def _collect_gpu_link_types() -> Dict[int, Dict[int, str]]:
+    """Map src GPU -> dst GPU -> link type ("XGMI", "PCIE", ...).
+
+    Source is `rocm-smi --showtopotype`, which prints a GPU x GPU table of link types.
+    Note that `amd-smi topology --linktype` is *not* a valid invocation on shipping
+    amd-smi builds (it raises AmdSmiInvalidParameterException), so rocm-smi is the
+    one reliable source here. Returns {} when the tool or table is unavailable; the
+    matrix card then simply carries no link types and the heatmap skips the overlay.
+    """
+    output = run_command(["rocm-smi", "--showtopotype"], record=False)
+    if not output:
+        return {}
+
+    links: Dict[int, Dict[int, str]] = {}
+    header: List[int] = []
+    for line in output.splitlines():
+        fields = line.split()
+        if not fields:
+            continue
+        if not header:
+            # Header row: the column labels, all of the form GPU<n>.
+            if all(f.upper().startswith("GPU") and f[3:].isdigit() for f in fields):
+                header = [int(f[3:]) for f in fields]
+            continue
+        row_label = fields[0].upper()
+        if not (row_label.startswith("GPU") and row_label[3:].isdigit()):
+            continue
+        src = int(row_label[3:])
+        row: Dict[int, str] = {}
+        for dst, value in zip(header, fields[1:]):
+            value = value.upper()
+            # The self-link is printed as "0"; it is not a link type.
+            if dst != src and value not in ("0", "N/A", "NA"):
+                row[dst] = value
+        if row:
+            links[src] = row
+    return links
+
+
+def _build_p2p_matrix_card(pairs: List[Dict],
+                           link_types: Optional[Dict[int, Dict[int, str]]] = None) -> Optional[Dict]:
     """Fold the per-pair P2P results into a single N x N bandwidth matrix card.
 
     The per-pair cards stay as they are; this adds one card the report can draw a
@@ -1721,6 +1783,19 @@ def _build_p2p_matrix_card(pairs: List[Dict]) -> Optional[Dict]:
     # would make the stats disagree with the picture they sit above.
     measured = [v for row in bandwidth for v in row if v]
 
+    # Link type per ordered pair, same shape as the bandwidth matrix so the report can
+    # overlay "is this hop XGMI or PCIe?" directly onto each heatmap cell. A PCIe hop
+    # in a node advertised as fully XGMI-connected is exactly the defect worth seeing.
+    link_matrix: Optional[List[List[Optional[str]]]] = None
+    if link_types:
+        link_matrix = [[None] * n for _ in range(n)]
+        for src, row in link_types.items():
+            if src not in index:
+                continue
+            for dst, kind in row.items():
+                if dst in index:
+                    link_matrix[index[src]][index[dst]] = kind
+
     card = OrderedDict()
     card["Section"] = "GPU P2P Bandwidth Matrix"
     card["GPU Count"] = str(n)
@@ -1729,10 +1804,15 @@ def _build_p2p_matrix_card(pairs: List[Dict]) -> Optional[Dict]:
         card["Min Bandwidth"] = f"{min(measured):.2f} GB/s"
         card["Max Bandwidth"] = f"{max(measured):.2f} GB/s"
         card["Mean Bandwidth"] = f"{sum(measured) / len(measured):.2f} GB/s"
+    if link_matrix:
+        kinds = sorted({k for row in link_matrix for k in row if k})
+        if kinds:
+            card["Link Types"] = ", ".join(kinds)
     card["_raw"] = {
         "gpu_ids": ids,
         "bandwidth_gbps": bandwidth,
         "p2p_enabled": enabled,
+        "link_types": link_matrix,
         "min_gbps": min(measured) if measured else None,
         "max_gbps": max(measured) if measured else None,
         "mean_gbps": (sum(measured) / len(measured)) if measured else None,
@@ -1823,13 +1903,17 @@ def gather_gpu_microbenchmarks(include_p2p: bool = False, verbose: bool = True) 
         compute_units = None
         max_clock_freq = None
         max_memory = None
+        # rocminfo lists the host CPU as an HSA agent too, and its Marketing Name
+        # ("AMD EPYC ...") matches the vendor test below. Only "Device Type: GPU"
+        # agents get peak-performance cards; one card per socket would otherwise appear.
+        device_type = None
 
         for line in rocminfo_output.splitlines():
             line = line.strip()
 
             if line.startswith("*******"):
                 # Process previous GPU
-                if current_gpu and compute_units:
+                if current_gpu and compute_units and device_type == "GPU":
                     gpu_key = f"{current_gpu}"
                     if gfx_version:
                         gpu_key += f" ({gfx_version})"
@@ -1847,6 +1931,10 @@ def gather_gpu_microbenchmarks(include_p2p: bool = False, verbose: bool = True) 
                 compute_units = None
                 max_clock_freq = None
                 max_memory = None
+                device_type = None
+
+            elif "Device Type:" in line and ":" in line:
+                device_type = line.split(":", 1)[1].strip().upper()
 
             elif "Marketing Name" in line and ":" in line:
                 gpu_name = line.split(":", 1)[1].strip()
@@ -1872,8 +1960,10 @@ def gather_gpu_microbenchmarks(include_p2p: bool = False, verbose: bool = True) 
                 except ValueError:
                     pass
 
-            elif current_gpu and "Name:" in line and "gfx" in line.lower():
-                # Try to extract GFX version
+            elif "Name:" in line and "gfx" in line.lower():
+                # rocminfo prints the agent's "Name: gfx942" BEFORE its "Marketing Name",
+                # so this must not be gated on current_gpu or the gfx version is never
+                # captured and every GPU lands in the unknown-architecture branch.
                 parts = line.split()
                 for part in parts:
                     if part.lower().startswith("gfx"):
@@ -1881,7 +1971,7 @@ def gather_gpu_microbenchmarks(include_p2p: bool = False, verbose: bool = True) 
                         break
 
         # Don't forget the last GPU
-        if current_gpu and compute_units:
+        if current_gpu and compute_units and device_type == "GPU":
             gpu_key = f"{current_gpu}"
             if gfx_version:
                 gpu_key += f" ({gfx_version})"
@@ -1906,7 +1996,7 @@ def gather_gpu_microbenchmarks(include_p2p: bool = False, verbose: bool = True) 
         if compile_result is not None or os.path.exists(kernel_exe_file):
             if verbose:
                 print(f"Running GPU kernel benchmarks: {kernel_exe_file}")
-            kernel_output = run_command([kernel_exe_file], timeout=BENCHMARK_TIMEOUT)
+            kernel_output = run_command([kernel_exe_file], timeout=BENCHMARK_TIMEOUT, env=_hip_runtime_env())
             
             if kernel_output:
                 try:
@@ -2004,7 +2094,7 @@ def gather_gpu_microbenchmarks(include_p2p: bool = False, verbose: bool = True) 
                 # Run the compiled benchmark
                 if verbose:
                     print(f"Running GPU P2P benchmark: {exe_file}")
-                p2p_output = run_command([exe_file], timeout=BENCHMARK_TIMEOUT)
+                p2p_output = run_command([exe_file], timeout=BENCHMARK_TIMEOUT, env=_hip_runtime_env())
 
                 if not p2p_output:
                     error_info = OrderedDict()
@@ -2055,7 +2145,8 @@ def gather_gpu_microbenchmarks(include_p2p: bool = False, verbose: bool = True) 
 
                                     microbenchmark_list.append(p2p_info)
 
-                                matrix_card = _build_p2p_matrix_card(p2p_pairs)
+                                matrix_card = _build_p2p_matrix_card(
+                                    p2p_pairs, _collect_gpu_link_types())
                                 if matrix_card:
                                     microbenchmark_list.append(matrix_card)
                             else:
@@ -2082,7 +2173,7 @@ def gather_gpu_microbenchmarks(include_p2p: bool = False, verbose: bool = True) 
             if compile_result is not None or os.path.exists(host_exe_file):
                 if verbose:
                     print(f"Running GPU-CPU bandwidth benchmark: {host_exe_file}")
-                host_output = run_command([host_exe_file], timeout=BENCHMARK_TIMEOUT)
+                host_output = run_command([host_exe_file], timeout=BENCHMARK_TIMEOUT, env=_hip_runtime_env())
 
                 if host_output:
                     try:
@@ -2137,7 +2228,7 @@ def gather_gpu_microbenchmarks(include_p2p: bool = False, verbose: bool = True) 
             if compile_result is not None or os.path.exists(topology_exe_file):
                 if verbose:
                     print(f"Running GPU topology analysis: {topology_exe_file}")
-                topology_output = run_command([topology_exe_file], timeout=BENCHMARK_TIMEOUT)
+                topology_output = run_command([topology_exe_file], timeout=BENCHMARK_TIMEOUT, env=_hip_runtime_env())
 
                 if topology_output:
                     try:
