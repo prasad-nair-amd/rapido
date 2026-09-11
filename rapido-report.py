@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 import argparse
 import json
+import math
 import sys
 from html import escape
 from pathlib import Path
@@ -11,6 +12,11 @@ def _render_dict_as_table(data: Dict[str, Any], comparison_data: Optional[Dict[s
     """Render a dictionary as an HTML table, highlighting differences if comparison data provided."""
     rows = []
     for key, value in data.items():
+        # Underscore-prefixed keys (e.g. "_raw") are machine-readable side-channel
+        # data for charting, not display rows.
+        if isinstance(key, str) and key.startswith("_"):
+            continue
+
         # Check if this value differs from comparison data
         is_different = False
         if comparison_data is not None:
@@ -18,15 +24,18 @@ def _render_dict_as_table(data: Dict[str, Any], comparison_data: Optional[Dict[s
             is_different = _values_differ(value, comp_value)
 
         highlight_class = ' class="highlight-diff"' if is_different else ''
+        # Marked on the row so the "Differences only" toolbar filter can hide
+        # matching rows. Only meaningful when comparison data was supplied.
+        row_attr = f" data-diff='{1 if is_different else 0}'" if comparison_data is not None else ""
 
         if isinstance(value, (dict, list)):
             comp_nested = comparison_data.get(key) if comparison_data else None
             rows.append(
-                f"<tr><th>{escape(str(key))}</th><td{highlight_class}>{_value_to_html(value, comp_nested)}</td></tr>"
+                f"<tr{row_attr}><th>{escape(str(key))}</th><td{highlight_class}>{_value_to_html(value, comp_nested)}</td></tr>"
             )
         else:
             rows.append(
-                f"<tr><th>{escape(str(key))}</th><td{highlight_class}>{escape(str(value))}</td></tr>"
+                f"<tr{row_attr}><th>{escape(str(key))}</th><td{highlight_class}>{escape(str(value))}</td></tr>"
             )
     return "<table class='info-table'>" + "".join(rows) + "</table>"
 
@@ -61,9 +70,16 @@ def _render_list_as_cards(items: List[Any], title: str = "", comparison_items: O
                         comparison_item = {k: v for k, v in comparison_items[idx].items() if k != "Section"}
 
             card_content = _render_dict_as_table(display_item, comparison_item)
+            # data-has-diff lets the toolbar's "Differences only" filter work
+            # without re-deriving the comparison client-side. A card with no
+            # counterpart at all is itself a difference - it exists in one file
+            # only - so it must not be filtered away as "same".
+            unmatched = comparison_items is not None and comparison_item is None
+            has_diff = "1" if unmatched or 'class="highlight-diff"' in card_content else "0"
             cards.append(
-                f"<div class='card'>"
-                f"<div class='card-header'>{escape(str(card_title))}</div>"
+                f"<div class='card' data-has-diff='{has_diff}'>"
+                f"<div class='card-header' onclick='toggleCard(this)' onkeydown='cardKey(event, this)' role='button' tabindex='0'>"
+                f"{escape(str(card_title))}</div>"
                 f"<div class='card-body'>{card_content}</div>"
                 f"</div>"
             )
@@ -111,6 +127,292 @@ def _value_to_html(value: Any, comparison_value: Any = None) -> str:
             items.append(f"<li>{_value_to_html(item, comp_item)}</li>")
         return "<ul>" + "".join(items) + "</ul>"
     return escape(str(value))
+
+
+# ---------------------------------------------------------------------------
+# Microbenchmark dashboard
+#
+# Charts are emitted as inline SVG built here in Python: no JS charting library,
+# so the report stays a single self-contained file that renders with no network.
+# Everything below consumes the "_raw" numeric blocks that rapido-collect.py
+# attaches to its benchmark cards; cards without "_raw" are simply skipped.
+# ---------------------------------------------------------------------------
+
+# A GPU whose result deviates from the node median by more than this is flagged.
+# In a healthy node of identical parts the spread is a couple of percent; 15%
+# is comfortably outside run-to-run noise but still catches a half-speed link.
+OUTLIER_THRESHOLD = 0.15
+
+# Cool (slow) to warm (fast). Interpolated between for the heatmap fill.
+_HEAT_COLORS = [(13, 71, 161), (2, 136, 209), (0, 150, 136), (255, 179, 0), (216, 67, 21)]
+
+
+def _is_num(value: Any) -> bool:
+    """True for a real, finite number.
+
+    A stray NaN or inf in the JSON (json.load accepts both) would otherwise
+    propagate into the colour maths and abort the whole report, so numbers are
+    checked with this rather than a bare isinstance everywhere below.
+    """
+    return isinstance(value, (int, float)) and not isinstance(value, bool) and math.isfinite(value)
+
+
+def _heat_color(fraction: float) -> str:
+    """Map 0.0-1.0 onto the heatmap gradient, returning a CSS rgb() string."""
+    if not math.isfinite(fraction):
+        fraction = 0.0
+    fraction = min(max(fraction, 0.0), 1.0)
+    pos = fraction * (len(_HEAT_COLORS) - 1)
+    low = int(pos)
+    high = min(low + 1, len(_HEAT_COLORS) - 1)
+    t = pos - low
+    r, g, b = (round(_HEAT_COLORS[low][i] + (_HEAT_COLORS[high][i] - _HEAT_COLORS[low][i]) * t)
+               for i in range(3))
+    return f"rgb({r},{g},{b})"
+
+
+def _median(values: List[float]) -> Optional[float]:
+    if not values:
+        return None
+    ordered = sorted(values)
+    mid = len(ordered) // 2
+    if len(ordered) % 2:
+        return ordered[mid]
+    return (ordered[mid - 1] + ordered[mid]) / 2
+
+
+def _find_raw(items: List[Any], section_contains: str) -> List[Dict[str, Any]]:
+    """Return the '_raw' blocks of every card whose Section contains the given text.
+
+    Section titles carry the GPU index ("GPU 3 Kernel Benchmarks"), so this
+    matches on the stable part of the title rather than the whole string.
+    """
+    found = []
+    for item in items:
+        if not isinstance(item, dict) or not isinstance(item.get("_raw"), dict):
+            continue
+        if section_contains in str(item.get("Section", "")):
+            found.append(item["_raw"])
+    return found
+
+
+def _render_p2p_heatmap(raw: Dict[str, Any]) -> str:
+    """Render the N x N P2P bandwidth matrix as a colour-scaled SVG grid."""
+    ids = raw.get("gpu_ids") or []
+    matrix = raw.get("bandwidth_gbps") or []
+    if not ids or not matrix:
+        return ""
+
+    n = len(ids)
+    measured = [v for row in matrix for v in row if _is_num(v)]
+    if not measured:
+        return ""
+    # Scale from zero rather than from the observed minimum. Min-max scaling
+    # would stretch a couple of percent of run-to-run noise across the whole
+    # gradient, making a healthy uniform node look alarmingly varied.
+    low, high = 0.0, max(measured)
+    span = high or 1.0
+
+    cell = 58 if n <= 10 else 40
+    label_w, label_h = 58, 30
+    width = label_w + n * cell + 8
+    height = label_h + n * cell + 48
+
+    parts = [
+        f"<svg class='chart' viewBox='0 0 {width} {height}' width='100%' "
+        f"role='img' aria-label='GPU peer-to-peer bandwidth matrix in GB/s'>"
+    ]
+    for j, dst in enumerate(ids):
+        x = label_w + j * cell + cell / 2
+        parts.append(f"<text x='{x:.1f}' y='{label_h - 10}' class='ax' text-anchor='middle'>{escape(str(dst))}</text>")
+    for i, src in enumerate(ids):
+        y = label_h + i * cell + cell / 2
+        parts.append(f"<text x='{label_w - 10}' y='{y + 4:.1f}' class='ax' text-anchor='end'>GPU {escape(str(src))}</text>")
+
+    for i in range(n):
+        row = matrix[i] if i < len(matrix) else []
+        for j in range(n):
+            value = row[j] if j < len(row) else None
+            x = label_w + j * cell
+            y = label_h + i * cell
+            # Cell labels are white by default, which disappears on the light
+            # diagonal and "not measured" fills, so those get dark text.
+            ink = "#ffffff"
+            if i == j:
+                fill, text, title = "#e9ecef", "—", f"GPU {ids[i]} (self)"
+                ink = "#343a40"
+            elif _is_num(value):
+                fill = _heat_color((value - low) / span)
+                text = f"{value:.0f}"
+                title = f"GPU {ids[i]} → GPU {ids[j]}: {value:.2f} GB/s"
+            else:
+                fill, text, title = "#f8d7da", "n/a", f"GPU {ids[i]} → GPU {ids[j]}: not measured"
+                ink = "#842029"
+            parts.append(
+                f"<g><title>{escape(title)}</title>"
+                f"<rect x='{x}' y='{y}' width='{cell - 2}' height='{cell - 2}' rx='3' fill='{fill}'/>"
+                f"<text x='{x + (cell - 2) / 2:.1f}' y='{y + cell / 2 + 4:.1f}' class='cell' "
+                f"fill='{ink}' text-anchor='middle'>{escape(text)}</text></g>"
+            )
+
+    # Gradient legend. Sized to the grid so it cannot run past the viewBox on a
+    # small node; the swatch count follows from the width rather than the reverse.
+    ly = label_h + n * cell + 16
+    legend_w = min(200, n * cell)
+    steps = max(8, int(legend_w // 5))
+    swatch = legend_w / steps
+    for step in range(steps):
+        parts.append(
+            f"<rect x='{label_w + step * swatch:.2f}' y='{ly}' width='{swatch:.2f}' height='12' "
+            f"fill='{_heat_color(step / (steps - 1))}'/>"
+        )
+    parts.append(f"<text x='{label_w}' y='{ly + 28}' class='ax'>{low:.0f} GB/s</text>")
+    parts.append(f"<text x='{label_w + legend_w}' y='{ly + 28}' class='ax' text-anchor='end'>{high:.0f} GB/s</text>")
+    parts.append("</svg>")
+    return "".join(parts)
+
+
+def _render_bar_chart(labels: List[str], values: List[Optional[float]], unit: str) -> str:
+    """Horizontal bars with a median marker; bars far off the median are flagged."""
+    present = [v for v in values if _is_num(v)]
+    if not present:
+        return ""
+    high = max(present) or 1.0
+    median = _median(present)
+
+    row_h, bar_w, label_w = 26, 300, 92
+    width = label_w + bar_w + 96
+    height = len(values) * row_h + 12
+
+    parts = [f"<svg class='chart' viewBox='0 0 {width} {height}' width='100%' role='img'>"]
+    for idx, (label, value) in enumerate(zip(labels, values)):
+        y = idx * row_h + 6
+        parts.append(
+            f"<text x='0' y='{y + 14}' class='ax'>{escape(str(label))}</text>"
+        )
+        if not _is_num(value):
+            parts.append(f"<text x='{label_w}' y='{y + 14}' class='ax'>not measured</text>")
+            continue
+        w = max((value / high) * bar_w, 1.0)
+        off = median and abs(value - median) / median > OUTLIER_THRESHOLD
+        fill = "#d84315" if off else "#4c6ef5"
+        parts.append(
+            f"<rect x='{label_w}' y='{y + 2}' width='{w:.1f}' height='{row_h - 10}' rx='2' fill='{fill}'/>"
+            f"<text x='{label_w + w + 6:.1f}' y='{y + 14}' class='val'>{value:,.2f}"
+            f"{' ⚠' if off else ''}</text>"
+        )
+    if median is not None and high:
+        mx = label_w + (median / high) * bar_w
+        parts.append(
+            f"<line class='med' x1='{mx:.1f}' y1='4' x2='{mx:.1f}' y2='{height - 6}' "
+            f"stroke-width='1' stroke-dasharray='3,3'><title>"
+            f"median {median:,.2f} {escape(unit)}</title></line>"
+        )
+    parts.append("</svg>")
+    return "".join(parts)
+
+
+def _uniformity_warnings(metric: str, labels: List[str], values: List[Optional[float]], unit: str) -> List[str]:
+    """Describe every GPU deviating from the node median by more than the threshold."""
+    present = [v for v in values if _is_num(v)]
+    median = _median(present)
+    if median is None or median == 0 or len(present) < 3:
+        return []
+    warnings = []
+    for label, value in zip(labels, values):
+        if not _is_num(value):
+            continue
+        delta = (value - median) / median
+        if abs(delta) > OUTLIER_THRESHOLD:
+            warnings.append(
+                f"{label}: {metric} {value:,.2f} {unit} is {delta * 100:+.1f}% "
+                f"vs. node median {median:,.2f} {unit}"
+            )
+    return warnings
+
+
+# (raw key, chart heading, unit) for the per-GPU bar charts.
+_GPU_BAR_METRICS = [
+    ("memory_bandwidth_gbps", "Memory Bandwidth", "GB/s"),
+    ("gemm_fp32_gflops", "GEMM FP32", "GFLOPS"),
+    ("gemm_fp64_gflops", "GEMM FP64", "GFLOPS"),
+    ("fma_tflops", "FMA Throughput", "TFLOPS"),
+    ("vector_add_gflops", "Vector Add", "GFLOPS"),
+    ("convolution_gflops", "1D Convolution", "GFLOPS"),
+]
+
+_HOST_BAR_METRICS = [
+    ("h2d_pinned_gbps", "Host→Device (Pinned)", "GB/s"),
+    ("d2h_pinned_gbps", "Device→Host (Pinned)", "GB/s"),
+]
+
+
+_NO_DASH = "<p class='no-data'>No chartable benchmark data</p>"
+
+
+def _render_microbench_dashboard(items: List[Any]) -> str:
+    """Build the charts panel that heads the Microbenchmarks tab.
+
+    Returns "" when the JSON predates the "_raw" numerics, so older files still
+    render exactly as before, just without charts.
+    """
+    panels: List[str] = []
+    warnings: List[str] = []
+
+    p2p = _find_raw(items, "GPU P2P Bandwidth Matrix")
+    if p2p:
+        heatmap = _render_p2p_heatmap(p2p[0])
+        if heatmap:
+            mean = p2p[0].get("mean_gbps")
+            low = p2p[0].get("min_gbps")
+            caption = "Peer-to-peer bandwidth, source GPU (rows) to destination GPU (columns)."
+            if mean and low and (mean - low) / mean > OUTLIER_THRESHOLD:
+                warnings.append(
+                    f"Slowest P2P link {low:.2f} GB/s is {((low - mean) / mean) * 100:+.1f}% "
+                    f"vs. the mean of {mean:.2f} GB/s"
+                )
+            panels.append(
+                f"<div class='panel'><h4>P2P Bandwidth Heatmap</h4>"
+                f"<p class='caption'>{caption}</p>{heatmap}</div>"
+            )
+
+    def bar_panels(raws: List[Dict[str, Any]], metrics, label_prefix: str) -> None:
+        if not raws:
+            return
+        raws = sorted(raws, key=lambda r: (r.get("gpu_id") if isinstance(r.get("gpu_id"), int) else 0))
+        labels = [f"GPU {r.get('gpu_id', '?')}" for r in raws]
+        for key, heading, unit in metrics:
+            values = [r.get(key) for r in raws]
+            chart = _render_bar_chart(labels, values, unit)
+            if not chart:
+                continue
+            panels.append(
+                f"<div class='panel'><h4>{escape(heading)} <span class='unit'>({escape(unit)})</span></h4>{chart}</div>"
+            )
+            warnings.extend(_uniformity_warnings(f"{label_prefix}{heading}", labels, values, unit))
+
+    bar_panels(_find_raw(items, "Kernel Benchmarks"), _GPU_BAR_METRICS, "")
+    bar_panels(_find_raw(items, "Host Transfer Bandwidth"), _HOST_BAR_METRICS, "Host transfer ")
+
+    if not panels:
+        return ""
+
+    warn_html = ""
+    if warnings:
+        rows = "".join(f"<li>{escape(w)}</li>" for w in warnings)
+        warn_html = (
+            f"<div class='uniformity-warn'><strong>Intra-node uniformity: "
+            f"{len(warnings)} outlier(s) beyond ±{OUTLIER_THRESHOLD * 100:.0f}% of the median</strong>"
+            f"<ul>{rows}</ul></div>"
+        )
+
+    return (
+        "<div class='dashboard'>"
+        "<div class='dashboard-header'>Microbenchmark Dashboard</div>"
+        f"{warn_html}"
+        f"<div class='panels'>{''.join(panels)}</div>"
+        "</div>"
+    )
 
 
 def _extract_section_data(data: Dict[str, Any], section: str) -> List[Dict[str, Any]]:
@@ -310,7 +612,19 @@ def generate_comparison_html(file1_path: Optional[Path], file2_path: Optional[Pa
         if has_rocm:
             rocm_content = _render_comparison_section(data1, data2, "rocm", "ROCm")
         if has_microbenchmarks:
-            microbenchmarks_content = _render_comparison_section(data1, data2, "microbenchmarks", "Microbenchmarks")
+            # Dashboards sit side by side above the cards, mirroring the card layout.
+            dash1 = _render_microbench_dashboard(microbench1)
+            dash2 = _render_microbench_dashboard(microbench2)
+            dashboards = ""
+            if dash1 or dash2:
+                dashboards = (
+                    "<div class='comparison-container'>"
+                    f"<div class='comparison-column'><h3>File 1</h3>{dash1 or _NO_DASH}</div>"
+                    f"<div class='comparison-column'><h3>File 2</h3>{dash2 or _NO_DASH}</div>"
+                    "</div>"
+                )
+            microbenchmarks_content = dashboards + _render_comparison_section(
+                data1, data2, "microbenchmarks", "Microbenchmarks")
     else:
         active_data = data1 or data2
         if has_cpu:
@@ -324,7 +638,11 @@ def generate_comparison_html(file1_path: Optional[Path], file2_path: Optional[Pa
         if has_rocm:
             rocm_content = _render_single_section(active_data, "rocm", "ROCm")
         if has_microbenchmarks:
-            microbenchmarks_content = _render_single_section(active_data, "microbenchmarks", "Microbenchmarks")
+            microbench_items = _extract_section_data(active_data, "microbenchmarks")
+            microbenchmarks_content = (
+                _render_microbench_dashboard(microbench_items)
+                + _render_single_section(active_data, "microbenchmarks", "Microbenchmarks")
+            )
 
     # HTML template with tabs
     html_template = f"""<!DOCTYPE html>
@@ -560,6 +878,217 @@ def generate_comparison_html(file1_path: Optional[Path], file2_path: Optional[Pa
             font-weight: 500;
         }}
 
+        /* ---- Toolbar ---- */
+        .toolbar {{
+            display: flex;
+            flex-wrap: wrap;
+            align-items: center;
+            gap: 10px;
+            padding: 12px 30px;
+            background: #f1f3f5;
+            border-bottom: 1px solid #dee2e6;
+        }}
+
+        .tb-search {{
+            flex: 1 1 240px;
+            min-width: 180px;
+            padding: 8px 12px;
+            border: 1px solid #ced4da;
+            border-radius: 4px;
+            font-size: 0.9rem;
+            background: white;
+            color: #212529;
+        }}
+
+        .tb-btn {{
+            padding: 8px 14px;
+            border: 1px solid #ced4da;
+            border-radius: 4px;
+            background: white;
+            color: #495057;
+            font-size: 0.88rem;
+            cursor: pointer;
+        }}
+
+        .tb-btn:hover {{
+            background: #e9ecef;
+        }}
+
+        .tb-check {{
+            font-size: 0.88rem;
+            color: #495057;
+            cursor: pointer;
+            user-select: none;
+        }}
+
+        .tb-count {{
+            font-size: 0.82rem;
+            color: #6c757d;
+            margin-left: auto;
+        }}
+
+        .card-header {{
+            cursor: pointer;
+        }}
+
+        .card.collapsed .card-body {{
+            display: none;
+        }}
+
+        .filtered-out {{
+            display: none !important;
+        }}
+
+        /* ---- Dark mode ---- */
+        body.dark {{
+            background: #16181d;
+        }}
+
+        body.dark .container,
+        body.dark .card,
+        body.dark .dashboard,
+        body.dark .tb-search,
+        body.dark .tb-btn {{
+            background: #1f2228;
+            color: #e4e6eb;
+        }}
+
+        body.dark .comparison-column,
+        body.dark .toolbar {{
+            background: #24272e;
+            border-color: #3a3f47;
+        }}
+
+        body.dark .info-table th {{
+            background: #2a2e36;
+            color: #c9ccd1;
+        }}
+
+        body.dark .info-table td,
+        body.dark .comparison-column h3,
+        body.dark .panel h4,
+        body.dark .tb-check {{
+            color: #e4e6eb;
+        }}
+
+        body.dark .info-table th,
+        body.dark .info-table td,
+        body.dark .card,
+        body.dark .dashboard {{
+            border-color: #3a3f47;
+        }}
+
+        body.dark .highlight-diff {{
+            background-color: #4d4426;
+            color: #ffeaa0;
+        }}
+
+        body.dark .chart text.ax,
+        body.dark .chart text.val {{
+            fill: #c9ccd1;
+        }}
+
+        body.dark .chart line.med {{
+            stroke: #8b9199;
+        }}
+
+        body.dark .dashboard {{
+            background: #21252b;
+        }}
+
+        body.dark .panel .unit,
+        body.dark .panel .caption {{
+            color: #9aa0a6;
+        }}
+
+        body.dark .uniformity-warn {{
+            background: #3a2a18;
+            color: #f3c99a;
+        }}
+
+        /* ---- Microbenchmark dashboard ---- */
+        .dashboard {{
+            background: white;
+            border: 1px solid #e0e0e0;
+            border-radius: 6px;
+            margin-bottom: 24px;
+            overflow: hidden;
+            box-shadow: 0 1px 3px rgba(0,0,0,0.05);
+        }}
+
+        .dashboard-header {{
+            background: linear-gradient(135deg, #232526 0%, #414345 100%);
+            color: white;
+            padding: 12px 16px;
+            font-weight: 600;
+            font-size: 1.05rem;
+        }}
+
+        .panels {{
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(360px, 1fr));
+            gap: 20px;
+            padding: 16px;
+        }}
+
+        .panel h4 {{
+            margin: 0 0 4px 0;
+            color: #343a40;
+            font-size: 0.95rem;
+        }}
+
+        .panel .unit {{
+            color: #6c757d;
+            font-weight: 400;
+        }}
+
+        .panel .caption {{
+            margin: 0 0 8px 0;
+            color: #6c757d;
+            font-size: 0.82rem;
+        }}
+
+        .chart {{
+            display: block;
+            max-width: 100%;
+            height: auto;
+            overflow: visible;
+        }}
+
+        .chart text.ax {{
+            font: 11px system-ui, sans-serif;
+            fill: #495057;
+        }}
+
+        .chart text.val {{
+            font: 11px system-ui, sans-serif;
+            fill: #212529;
+        }}
+
+        /* Cell fill colour is set per-cell inline, since it depends on how
+           light the swatch underneath it is. */
+        .chart text.cell {{
+            font: 11px system-ui, sans-serif;
+            font-weight: 600;
+        }}
+
+        .chart line.med {{
+            stroke: #495057;
+        }}
+
+        .uniformity-warn {{
+            background: #fff4e5;
+            border-left: 4px solid #d84315;
+            margin: 16px 16px 0 16px;
+            padding: 12px 16px;
+            color: #5f2c0a;
+            font-size: 0.9rem;
+        }}
+
+        .uniformity-warn ul {{
+            margin: 8px 0 0 0;
+        }}
+
         .no-data {{
             text-align: center;
             padding: 40px;
@@ -613,6 +1142,15 @@ def generate_comparison_html(file1_path: Optional[Path], file2_path: Optional[Pa
             {f'<button class="tab{" active" if first_tab == "network" else ""}" onclick="openTab(event, ' + "'network'" + ')" draggable="true" data-tab="network">Network</button>' if has_network else ''}
             {f'<button class="tab{" active" if first_tab == "bmc" else ""}" onclick="openTab(event, ' + "'bmc'" + ')" draggable="true" data-tab="bmc">BMC</button>' if has_bmc else ''}
             {f'<button class="tab{" active" if first_tab == "microbenchmarks" else ""}" onclick="openTab(event, ' + "'microbenchmarks'" + ')" draggable="true" data-tab="microbenchmarks">Microbenchmarks</button>' if has_microbenchmarks else ''}
+        </div>
+
+        <div class="toolbar">
+            <input type="search" id="cardSearch" class="tb-search" placeholder="Search cards and values…"
+                   aria-label="Filter cards" oninput="applyFilters()">
+            {'''<label class="tb-check"><input type="checkbox" id="diffOnly" onchange="applyFilters()"> Differences only</label>''' if is_comparison else ''}
+            <button class="tb-btn" onclick="toggleAllCards()" id="collapseAllBtn">Collapse all</button>
+            <button class="tb-btn" onclick="toggleDarkMode()" id="darkBtn">Dark mode</button>
+            <span class="tb-count" id="filterCount"></span>
         </div>
 
         {f'<div id="cpu" class="tab-content{" active" if first_tab == "cpu" else ""}">{cpu_content}</div>' if has_cpu else ''}
@@ -777,9 +1315,132 @@ def generate_comparison_html(file1_path: Optional[Path], file2_path: Optional[Pa
             }}
         }}
 
-        // Initialize drag and drop when page loads
+        // ---- Toolbar: search, diff-only, collapse, dark mode ----
+
+        // Combined filter pass. Runs over the active tab only, since the other
+        // tabs are display:none anyway and a full-document pass is wasteful on
+        // reports with hundreds of ROCm package rows.
+        function applyFilters() {{
+            const term = (document.getElementById('cardSearch').value || '').toLowerCase().trim();
+            const diffBox = document.getElementById('diffOnly');
+            const diffOnly = diffBox ? diffBox.checked : false;
+            const active = document.querySelector('.tab-content.active');
+            if (!active) return;
+
+            let shown = 0;
+            const cards = active.querySelectorAll('.card');
+            cards.forEach(card => {{
+                // Row-level diff filtering first, so the card's visible text
+                // reflects what the search then matches against.
+                card.querySelectorAll('tr[data-diff]').forEach(row => {{
+                    row.classList.toggle('filtered-out', diffOnly && row.dataset.diff !== '1');
+                }});
+
+                let visible = true;
+                if (diffOnly && card.dataset.hasDiff === '0') visible = false;
+                if (visible && term) {{
+                    // Match against what is actually on screen: textContent would
+                    // still include rows the diff filter just hid.
+                    let text = card.querySelector('.card-header').textContent;
+                    card.querySelectorAll('tr').forEach(row => {{
+                        if (!row.classList.contains('filtered-out')) text += ' ' + row.textContent;
+                    }});
+                    visible = text.toLowerCase().indexOf(term) !== -1;
+                }}
+                card.classList.toggle('filtered-out', !visible);
+                if (visible) shown++;
+            }});
+
+            const counter = document.getElementById('filterCount');
+            counter.textContent = (term || diffOnly)
+                ? shown + ' of ' + cards.length + ' cards shown'
+                : '';
+        }}
+
+        function toggleCard(header) {{
+            header.parentElement.classList.toggle('collapsed');
+        }}
+
+        // Space/Enter on a focused header, since the header is a div with
+        // role="button" and gets no native keyboard activation.
+        function cardKey(event, header) {{
+            if (event.key === 'Enter' || event.key === ' ' || event.key === 'Spacebar') {{
+                event.preventDefault();
+                toggleCard(header);
+            }}
+        }}
+
+        function toggleAllCards() {{
+            const active = document.querySelector('.tab-content.active');
+            if (!active) return;
+            const cards = active.querySelectorAll('.card');
+            // Derive the direction from this tab's own state rather than from the
+            // button label, which is shared across tabs.
+            let collapsed = 0;
+            cards.forEach(card => {{ if (card.classList.contains('collapsed')) collapsed++; }});
+            const collapse = collapsed < cards.length;
+            cards.forEach(card => {{ card.classList.toggle('collapsed', collapse); }});
+            syncCollapseLabel();
+        }}
+
+        // Label reflects what the button will do next for the active tab.
+        function syncCollapseLabel() {{
+            const btn = document.getElementById('collapseAllBtn');
+            const active = document.querySelector('.tab-content.active');
+            if (!btn || !active) return;
+            const cards = active.querySelectorAll('.card');
+            let collapsed = 0;
+            cards.forEach(card => {{ if (card.classList.contains('collapsed')) collapsed++; }});
+            btn.textContent = (cards.length && collapsed === cards.length) ? 'Expand all' : 'Collapse all';
+        }}
+
+        function toggleDarkMode() {{
+            const on = document.body.classList.toggle('dark');
+            document.getElementById('darkBtn').textContent = on ? 'Light mode' : 'Dark mode';
+            try {{ localStorage.setItem('rapidoDark', on ? '1' : '0'); }} catch (e) {{}}
+        }}
+
+        // Deep links: #gpu etc. select that tab on load, and selecting a tab
+        // updates the fragment so the URL can be shared.
+        function selectTabByName(name) {{
+            // Tab ids are plain slugs; anything else is not a tab and must not
+            // reach querySelector, where a quote would throw a syntax error.
+            if (!/^[A-Za-z0-9_-]+$/.test(name)) return false;
+            const btn = document.querySelector('.tab[data-tab="' + name + '"]');
+            const panel = document.getElementById(name);
+            if (!btn || !panel) return false;
+            document.querySelectorAll('.tab-content').forEach(c => c.classList.remove('active'));
+            document.querySelectorAll('.tab').forEach(t => t.classList.remove('active'));
+            panel.classList.add('active');
+            btn.classList.add('active');
+            return true;
+        }}
+
         document.addEventListener('DOMContentLoaded', function() {{
             initDragAndDrop();
+
+            try {{
+                if (localStorage.getItem('rapidoDark') === '1') toggleDarkMode();
+            }} catch (e) {{}}
+
+            const hash = (location.hash || '').replace('#', '');
+            if (hash) selectTabByName(hash);
+            syncCollapseLabel();
+
+            // Keep the fragment in sync and re-apply filters on tab switches.
+            document.querySelectorAll('.tab').forEach(tab => {{
+                tab.addEventListener('click', function() {{
+                    const name = this.getAttribute('data-tab');
+                    // replaceState throws on a file:// URL in some browsers;
+                    // a failed deep link must not take the rest of this handler
+                    // (and therefore the filters) down with it.
+                    if (name) {{
+                        try {{ history.replaceState(null, '', '#' + name); }} catch (e) {{}}
+                    }}
+                    syncCollapseLabel();
+                    applyFilters();
+                }});
+            }});
         }});
     </script>
 </body>

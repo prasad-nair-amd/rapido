@@ -52,6 +52,18 @@ python3 rapido-collect.py -m -p
 # Verbose mode - shows tool availability check and progress messages
 python3 rapido-collect.py -v
 
+# Control where the JSON is written
+python3 rapido-collect.py -o /tmp/myrun.json          # exact path
+python3 rapido-collect.py --output-dir ./runs         # serverinfo_<hostname>.json in ./runs
+python3 rapido-collect.py --tag before                # serverinfo_<hostname>_before.json
+
+# Collect the same host twice without overwriting, then compare the two runs
+python3 rapido-collect.py -m -p --tag before
+# ... make a change ...
+python3 rapido-collect.py -m -p --tag after
+python3 rapido-report.py -f1 serverinfo_$(hostname)_before.json \
+                         -f2 serverinfo_$(hostname)_after.json
+
 # Full collection with all features and verbose output
 sudo python3 rapido-collect.py -a -p -v
 ```
@@ -71,8 +83,15 @@ python3 rapido-report.py -i serverinfo_server1.json -o report.html
 **Comparison Report Features**:
 - Side-by-side layout for easy visual comparison
 - **Yellow highlighting** automatically applied to fields with different values
+- **Differences only** toggle hides every matching row so only the deltas remain
 - Intelligent matching of corresponding components (GPUs, network interfaces, etc.)
 - Works across all sections: CPU, GPU, ROCm, Network, BMC, and Microbenchmarks
+
+**Report Features** (single and comparison mode):
+- **Microbenchmark dashboard**: P2P bandwidth heatmap and per-GPU bar charts, with
+  automatic flagging of any GPU or link deviating more than 15% from the node median
+- **Search** across all cards, **collapsible cards**, **dark mode**, deep-linkable tabs
+- Still a single self-contained HTML file - no external assets, renders offline
 
 ### GPU Benchmarks
 ```bash
@@ -122,6 +141,23 @@ hipcc -o gpu_topology gpu_topology.cpp
 - When no flags or `-a` is used, all basic sections are collected (CPU, GPU, Network, BMC, ROCm)
 - **Important**: Microbenchmarks are ONLY collected when `-m` flag is explicitly specified
 - Note: `-m` flag automatically enables ROCm collection (microbenchmarks need ROCm info)
+
+**Output location flags**: Control where the JSON is written
+- `-o` or `--output FILE`: Write to this exact path, overriding the default filename
+- `--output-dir DIR`: Write the default-named file into this directory (created if missing)
+- `--tag TAG`: Append a suffix, e.g. `--tag before` -> `serverinfo_<hostname>_before.json`
+- Default remains `serverinfo_<hostname>.json` in the current directory
+- `-o` takes precedence over `--output-dir` and `--tag`
+- Useful for collecting the same host before and after a change without overwriting
+
+**Command timeouts**: Every external command runs under a wall-clock limit
+- Default 60s; 600s for HIP compilation; 1800s for the GPU benchmarks
+- A hung tool (e.g. `amd-smi` against a wedged GPU, `ipmitool` against an unresponsive BMC)
+  no longer blocks the entire collection
+- Failures are recorded in `_metadata.command_failures` with a reason: `not_found`,
+  `timeout`, or `error` - so an empty section can be explained rather than being
+  mistaken for "this machine has no such hardware"
+- Timeouts are always reported at the end of the run; errors are shown with `-v`
 
 **Error handling and crash protection**:
 - Each section has individual error handling - if one section fails, others continue
@@ -208,12 +244,33 @@ hipcc -o gpu_topology gpu_topology.cpp
 - Applies `highlight-diff` CSS class (yellow background) to differing values
 - Works recursively through nested dictionaries and lists
 
+**Microbenchmark dashboard**: Charts rendered above the Microbenchmarks cards
+- `_render_p2p_heatmap()`: The N×N P2P bandwidth matrix as a colour-scaled grid, replacing
+  56 unreadable per-pair cards on an 8-GPU node with one glance. Hover for exact GB/s.
+- `_render_bar_chart()`: One bar per GPU per benchmark, with a dashed median marker, so a
+  single degraded GPU in a node of 8 is visually obvious
+- `_uniformity_warnings()`: Flags any GPU deviating more than `OUTLIER_THRESHOLD` (15%)
+  from the node median - the most common defect an acceptance audit is looking for
+- Charts are **inline SVG generated in Python** - no JS charting library, so the report
+  remains a single self-contained file that renders with no network access
+- Consumes the `_raw` numeric blocks; JSON files collected before those existed still
+  render normally, just without charts
+
+**Toolbar**: Controls above the tab content
+- **Live search** filters cards by any text they contain
+- **Differences only** (comparison mode) hides every card and row whose values match
+- **Collapse all / Expand all**, plus click any card header to collapse that card
+- **Dark mode**, persisted in localStorage
+- Tabs are deep-linkable: `report.html#gpu` opens the GPU tab directly
+
 **HTML output**: 
 - Tabbed interface (CPU, GPU, ROCm, Network, BMC*, Microbenchmarks*)
 - Tabs are draggable/reorderable with localStorage persistence
 - Conditional BMC and Microbenchmarks tabs based on data availability
 - Gradient purple theme with responsive design
 - **Yellow highlighting** (`#fff9c4` background) for differences in comparison mode
+- Underscore-prefixed JSON keys (e.g. `_raw`) are treated as machine-readable side-channel
+  data and are never rendered as display rows
 
 ### gpu_p2p_bandwidth.cpp (HIP benchmark)
 **Purpose**: Measures GPU-to-GPU communication bandwidth
