@@ -6,6 +6,8 @@ __pycache__/
 /gpu_p2p_bandwidth
 /gpu_host_bandwidth
 /gpu_topology
+/gpu_gemm_library
+/gpu_rccl_collectives
 
 # Collected data and generated reports
 serverinfo_*.json

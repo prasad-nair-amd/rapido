@@ -103,6 +103,68 @@ def run_command(cmd: List[str], timeout: Optional[int] = DEFAULT_COMMAND_TIMEOUT
         fail("error", f"{type(e).__name__}: {str(e)[:200]}")
         return None
 
+
+def _amd_smi_json(args: List[str], timeout: int = DEFAULT_COMMAND_TIMEOUT,
+                  record: bool = True) -> Optional[object]:
+    """Run `amd-smi <args> --json` and return the parsed result, or None.
+
+    amd-smi's JSON output is the only stable contract it offers; the human-readable
+    form reflows between releases. Everything that reads amd-smi structurally goes
+    through here so the parse and its failure mode live in one place.
+    """
+    output = run_command(["amd-smi"] + list(args) + ["--json"], timeout=timeout, record=record)
+    if not output:
+        return None
+    try:
+        return json.loads(output)
+    except (ValueError, TypeError):
+        if record:
+            COMMAND_FAILURES["amd-smi " + " ".join(args)] = {
+                "reason": "error", "detail": "Output was not valid JSON"}
+        return None
+
+
+def _num(value: object) -> Optional[float]:
+    """Return value as a number, or None if it is not one.
+
+    amd-smi reports unsupported fields as the *string* "N/A" mixed in among real
+    integers (PCIE_BIF and HDP ECC blocks on MI300X, several violation sub-fields).
+    Feeding those to int() raises, and testing them for truthiness counts them as
+    present-and-zero, which would turn "this block has no ECC support" into "this
+    block reports no errors". Both are wrong in ways that matter for an RMA call.
+    """
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, (int, float)):
+        return float(value)
+    if isinstance(value, str):
+        try:
+            return float(value.strip())
+        except ValueError:
+            return None
+    return None
+
+
+def _int(value: object) -> Optional[int]:
+    """_num, narrowed to an int. Returns None for non-numeric values."""
+    number = _num(value)
+    return None if number is None else int(number)
+
+
+def _read_sysfs(path: str) -> Optional[str]:
+    """Contents of a sysfs/procfs file, stripped, or None if it cannot be read.
+
+    Unreadable is the normal case for much of what the platform collector looks at
+    (attributes vary by kernel, driver and privilege level), so this never records a
+    failure -- the absence of a field is the signal.
+    """
+    try:
+        with open(path, "r", encoding="utf-8", errors="replace") as handle:
+            return handle.read().strip()
+    except OSError:
+        return None
+
+
 def check_tool_availability(verbose: bool = True) -> None:
     """Check and report availability of all required and optional tools."""
     system = platform.system().lower()
@@ -893,6 +955,873 @@ def gather_cpu_details() -> Dict[str, Dict[str, str]]:
         details["macos"] = mac_cpu_info()
     return details
 
+def _gpu_data_rows(payload: object) -> List[Dict]:
+    """Normalise amd-smi's per-GPU JSON into a list of dicts.
+
+    Most subcommands wrap their rows in {"gpu_data": [...]}, but some (bad-pages)
+    return the bare list, and a single-GPU query can return a bare dict. Callers
+    should not have to care which shape they got.
+    """
+    if isinstance(payload, dict):
+        rows = payload.get("gpu_data", payload)
+    else:
+        rows = payload
+    if isinstance(rows, dict):
+        rows = [rows]
+    if not isinstance(rows, list):
+        return []
+    return [row for row in rows if isinstance(row, dict)]
+
+
+def _gpu_index(row: Dict, fallback: int) -> int:
+    """The GPU index a row describes, falling back to its position."""
+    index = _int(row.get("gpu"))
+    return fallback if index is None else index
+
+
+def _amd_smi_value(entry: object) -> Optional[float]:
+    """Unwrap amd-smi's {"value": N, "unit": "W"} wrapper to the number.
+
+    Fields switch between the wrapped form and a bare scalar depending on the
+    subcommand, and unsupported ones are the string "N/A", so all three go through
+    _num and come out as either a number or None.
+    """
+    if isinstance(entry, dict):
+        return _num(entry.get("value"))
+    return _num(entry)
+
+
+def _amd_smi_unit(entry: object, default: str = "") -> str:
+    """The unit string from amd-smi's {"value", "unit"} wrapper."""
+    if isinstance(entry, dict):
+        unit = entry.get("unit")
+        if isinstance(unit, str) and unit:
+            return unit
+    return default
+
+
+# ECC blocks amd-smi enumerates on Instinct parts. Blocks that report "N/A" are
+# unsupported on the ASIC, which is different from "supported and reporting zero" --
+# conflating the two would invent clean bills of health the hardware never gave.
+_ECC_COUNT_KINDS = [
+    ("correctable_count", "Correctable"),
+    ("uncorrectable_count", "Uncorrectable"),
+    ("deferred_count", "Deferred"),
+]
+
+
+def _bad_page_count(entry: object) -> Optional[int]:
+    """Number of bad pages in an amd-smi bad-pages field.
+
+    The clean case is not an empty list: amd-smi returns the literal string
+    "No bad pages found.". A list is the populated case, one entry per page.
+    """
+    if isinstance(entry, list):
+        return len(entry)
+    if isinstance(entry, str):
+        return 0 if "no bad pages" in entry.lower() else None
+    return _int(entry)
+
+
+def gather_ras_health() -> Dict[str, List[Dict[str, str]]]:
+    """ECC counters, retired pages and XGMI link errors, per GPU plus a node summary.
+
+    This is the data an acceptance audit turns down a node over: uncorrectable ECC
+    errors and retired memory pages are the documented RMA triggers, and until now
+    rapido could not see either. Correctable counts are reported but not flagged --
+    on HBM they are expected and corrected in hardware.
+    """
+    if platform.system().lower() != "linux":
+        return OrderedDict()
+
+    ecc = _gpu_data_rows(_amd_smi_json(["metric", "--ecc"]))
+    blocks = _gpu_data_rows(_amd_smi_json(["metric", "--ecc-blocks"]))
+    pages = _gpu_data_rows(_amd_smi_json(["bad-pages"]))
+    xgmi_err = _gpu_data_rows(_amd_smi_json(["metric", "--xgmi-err"]))
+    if not (ecc or blocks or pages or xgmi_err):
+        return OrderedDict()
+
+    def by_gpu(rows: List[Dict]) -> Dict[int, Dict]:
+        return {_gpu_index(row, position): row for position, row in enumerate(rows)}
+
+    ecc_by_gpu = by_gpu(ecc)
+    blocks_by_gpu = by_gpu(blocks)
+    pages_by_gpu = by_gpu(pages)
+    xgmi_by_gpu = by_gpu(xgmi_err)
+
+    gpu_ids = sorted(set(ecc_by_gpu) | set(blocks_by_gpu) | set(pages_by_gpu) | set(xgmi_by_gpu))
+    entries: List[Dict[str, str]] = []
+
+    node_uncorrectable = 0
+    node_correctable = 0
+    node_deferred = 0
+    node_retired = 0
+    node_pending = 0
+    unhealthy_gpus: List[str] = []
+
+    for gpu_id in gpu_ids:
+        card: Dict[str, str] = OrderedDict()
+        card["Section"] = f"GPU {gpu_id} - RAS Health"
+        raw: Dict[str, object] = {"gpu_id": gpu_id}
+
+        totals = ecc_by_gpu.get(gpu_id, {}).get("ecc")
+        totals = totals if isinstance(totals, dict) else {}
+        correctable = _int(totals.get("total_correctable_count"))
+        uncorrectable = _int(totals.get("total_uncorrectable_count"))
+        deferred = _int(totals.get("total_deferred_count"))
+        if correctable is not None:
+            card["Total Correctable Errors"] = str(correctable)
+            raw["ecc_correctable"] = correctable
+            node_correctable += correctable
+        if uncorrectable is not None:
+            card["Total Uncorrectable Errors"] = str(uncorrectable)
+            raw["ecc_uncorrectable"] = uncorrectable
+            node_uncorrectable += uncorrectable
+        if deferred is not None:
+            card["Total Deferred Errors"] = str(deferred)
+            raw["ecc_deferred"] = deferred
+            node_deferred += deferred
+
+        block_data = blocks_by_gpu.get(gpu_id, {}).get("ecc_blocks")
+        if isinstance(block_data, dict):
+            unsupported: List[str] = []
+            for block_name, counts in block_data.items():
+                if not isinstance(counts, dict):
+                    continue
+                parts = []
+                for key, label in _ECC_COUNT_KINDS:
+                    count = _int(counts.get(key))
+                    if count is not None:
+                        parts.append(f"{label} {count}")
+                        raw[f"ecc_{str(block_name).lower()}_{key}"] = count
+                if parts:
+                    card[f"ECC Block {block_name}"] = ", ".join(parts)
+                else:
+                    # Every count was "N/A": the ASIC does not instrument this block.
+                    unsupported.append(str(block_name))
+            if unsupported:
+                card["ECC Blocks Not Instrumented"] = ", ".join(sorted(unsupported))
+
+        page_row = pages_by_gpu.get(gpu_id, {})
+        retired = _bad_page_count(page_row.get("retired"))
+        pending = _bad_page_count(page_row.get("pending"))
+        unreserved = _bad_page_count(page_row.get("un_res"))
+        if retired is not None:
+            card["Retired Memory Pages"] = str(retired)
+            raw["bad_pages_retired"] = retired
+            node_retired += retired
+        if pending is not None:
+            card["Pending Memory Pages"] = str(pending)
+            raw["bad_pages_pending"] = pending
+            node_pending += pending
+        if unreserved is not None:
+            card["Unreservable Memory Pages"] = str(unreserved)
+            raw["bad_pages_unreservable"] = unreserved
+
+        xgmi_value = xgmi_by_gpu.get(gpu_id, {}).get("xgmi_err")
+        xgmi_count = _int(xgmi_value)
+        if xgmi_count is not None:
+            card["XGMI Link Errors"] = str(xgmi_count)
+            raw["xgmi_errors"] = xgmi_count
+        elif xgmi_value is not None:
+            card["XGMI Link Errors"] = "Not reported by driver"
+
+        flags = []
+        if uncorrectable:
+            flags.append(f"{uncorrectable} uncorrectable ECC error(s)")
+        if retired:
+            flags.append(f"{retired} retired page(s)")
+        if pending:
+            flags.append(f"{pending} pending page(s)")
+        if xgmi_count:
+            flags.append(f"{xgmi_count} XGMI error(s)")
+        if flags:
+            card["Health"] = "ATTENTION: " + "; ".join(flags)
+            unhealthy_gpus.append(f"GPU {gpu_id} ({'; '.join(flags)})")
+            raw["healthy"] = False
+        else:
+            card["Health"] = "OK"
+            raw["healthy"] = True
+
+        if len(card) > 1:
+            card["_raw"] = raw
+            entries.append(card)
+
+    if entries:
+        summary: Dict[str, str] = OrderedDict()
+        summary["Section"] = "RAS Health Summary"
+        summary["GPUs Checked"] = str(len(entries))
+        summary["Node Correctable Errors"] = str(node_correctable)
+        summary["Node Uncorrectable Errors"] = str(node_uncorrectable)
+        summary["Node Deferred Errors"] = str(node_deferred)
+        summary["Node Retired Pages"] = str(node_retired)
+        summary["Node Pending Pages"] = str(node_pending)
+        if unhealthy_gpus:
+            summary["Status"] = ("ATTENTION: uncorrectable errors or bad pages present; "
+                                 "these are RMA indicators")
+            summary["Affected GPUs"] = "; ".join(unhealthy_gpus)
+        else:
+            summary["Status"] = "OK - no uncorrectable errors and no bad pages"
+        summary["_raw"] = {
+            "gpus_checked": len(entries),
+            "node_ecc_correctable": node_correctable,
+            "node_ecc_uncorrectable": node_uncorrectable,
+            "node_ecc_deferred": node_deferred,
+            "node_bad_pages_retired": node_retired,
+            "node_bad_pages_pending": node_pending,
+            "healthy": not unhealthy_gpus,
+        }
+        entries.insert(0, summary)
+
+    return OrderedDict([("linux", entries)]) if entries else OrderedDict()
+
+
+def _num_prefix(value: object) -> Optional[float]:
+    """Leading number of a string like "16 lanes" or "32 GT/s", else None.
+
+    linux_gpu_info() stores the static PCIe maximums already formatted with their
+    units, and those strings are the comparison baseline for the live link state.
+    """
+    number = _num(value)
+    if number is not None:
+        return number
+    if not isinstance(value, str):
+        return None
+    digits = ""
+    for char in value.strip():
+        if char.isdigit() or (char == "." and "." not in digits):
+            digits += char
+        else:
+            break
+    return _num(digits) if digits else None
+
+
+def _gpu_id_from_section(section: object) -> Optional[int]:
+    """GPU index out of a card's Section label.
+
+    Covers both shapes rapido produces: "GPU 3 - Telemetry" and linux_gpu_info()'s
+    "AMD Instinct MI300X (GPU 3)".
+    """
+    if not isinstance(section, str):
+        return None
+    words = section.replace("(", " ").replace(")", " ").split()
+    for position, word in enumerate(words):
+        if word.upper() == "GPU" and position + 1 < len(words):
+            index = _int(words[position + 1].rstrip(":-"))
+            if index is not None:
+                return index
+    return None
+
+
+def _pcie_speed_gts(value: object) -> Optional[float]:
+    """PCIe speed in GT/s from amd-smi's wrapped value or from a string like "32 GT/s"."""
+    number = _amd_smi_value(value)
+    if number is not None:
+        return number
+    return _num_prefix(value)
+
+
+def _max_pcie_by_gpu(gpu_details: Optional[Dict[str, List[Dict[str, str]]]]) -> Dict[int, Dict[str, float]]:
+    """Per-GPU maximum PCIe width/speed already captured by linux_gpu_info().
+
+    Reusing the static maximums avoids a second amd-smi call and, more importantly,
+    gives the current-vs-maximum comparison that turns a bare "x16" into a verdict.
+    """
+    maxima: Dict[int, Dict[str, float]] = {}
+    if not isinstance(gpu_details, dict):
+        return maxima
+    for entries in gpu_details.values():
+        if not isinstance(entries, list):
+            continue
+        for entry in entries:
+            if not isinstance(entry, dict):
+                continue
+            index = _gpu_id_from_section(entry.get("Section"))
+            if index is None:
+                continue
+            record: Dict[str, float] = {}
+            # linux_gpu_info() formats these as "16 lanes" and "32 GT/s"; both
+            # helpers pull the leading number back out.
+            width = _num_prefix(entry.get("Max PCIe Link Width"))
+            speed = _num_prefix(entry.get("Max PCIe Speed"))
+            if width is not None:
+                record["width"] = width
+            if speed is not None:
+                record["speed"] = speed
+            if record:
+                maxima.setdefault(index, {}).update(record)
+    return maxima
+
+
+def gather_gpu_telemetry(gpu_details: Optional[Dict[str, List[Dict[str, str]]]] = None
+                         ) -> Dict[str, List[Dict[str, str]]]:
+    """Point-in-time power, thermal, clock, PCIe link and throttle state per GPU.
+
+    The point is not the readings themselves but two derived verdicts the readings
+    make possible: whether the PCIe link trained to its full width and speed, and
+    whether the GPU is currently in violation of a power or thermal limit. A link
+    that trained to x8 in an x16 slot is a seated-card defect that no static
+    inventory of "Max PCIe Width: 16" can reveal.
+
+    One targeted amd-smi invocation per metric group, with selector flags. amd-smi is
+    itself a Python program with a several-hundred-millisecond startup, and an
+    unselected `metric` call dumps every group including a full ECC enumeration, so
+    polling here would cost far more than the snapshot is worth.
+    """
+    if platform.system().lower() != "linux":
+        return OrderedDict()
+
+    readings = _gpu_data_rows(_amd_smi_json(
+        ["metric", "--power", "--temperature", "--clock", "--usage"]))
+    pcie = _gpu_data_rows(_amd_smi_json(["metric", "--pcie"]))
+    violation = _gpu_data_rows(_amd_smi_json(["metric", "--violation"]))
+    if not (readings or pcie or violation):
+        return OrderedDict()
+
+    def by_gpu(rows: List[Dict]) -> Dict[int, Dict]:
+        return {_gpu_index(row, position): row for position, row in enumerate(rows)}
+
+    readings_by_gpu = by_gpu(readings)
+    pcie_by_gpu = by_gpu(pcie)
+    violation_by_gpu = by_gpu(violation)
+    maxima = _max_pcie_by_gpu(gpu_details)
+
+    entries: List[Dict[str, str]] = []
+    degraded_links: List[str] = []
+    active_violations: List[str] = []
+
+    for gpu_id in sorted(set(readings_by_gpu) | set(pcie_by_gpu) | set(violation_by_gpu)):
+        card: Dict[str, str] = OrderedDict()
+        card["Section"] = f"GPU {gpu_id} - Telemetry"
+        raw: Dict[str, object] = {"gpu_id": gpu_id}
+
+        row = readings_by_gpu.get(gpu_id, {})
+
+        power = row.get("power")
+        if isinstance(power, dict):
+            socket_power = _amd_smi_value(power.get("socket_power"))
+            if socket_power is not None:
+                unit = _amd_smi_unit(power.get("socket_power"), "W")
+                card["Socket Power"] = f"{socket_power:g} {unit}"
+                raw["socket_power_w"] = socket_power
+            management = power.get("power_management")
+            if isinstance(management, str) and management:
+                card["Power Management"] = management
+
+        temperature = row.get("temperature")
+        if isinstance(temperature, dict):
+            for key, label in (("hotspot", "Hotspot Temperature"),
+                               ("edge", "Edge Temperature"),
+                               ("mem", "Memory Temperature")):
+                value = _amd_smi_value(temperature.get(key))
+                if value is not None:
+                    unit = _amd_smi_unit(temperature.get(key), "C")
+                    card[label] = f"{value:g} {unit}"
+                    raw[f"temp_{key}_c"] = value
+
+        # MI300 exposes one clock domain per XCD (gfx_0..gfx_7). Reporting eight
+        # near-identical rows buries the reading, so summarise the range instead.
+        clock = row.get("clock")
+        if isinstance(clock, dict):
+            gfx_clocks = []
+            max_clocks = []
+            locked = set()
+            for domain, info in clock.items():
+                if not (isinstance(domain, str) and domain.startswith("gfx") and isinstance(info, dict)):
+                    continue
+                current = _amd_smi_value(info.get("clk"))
+                ceiling = _amd_smi_value(info.get("max_clk"))
+                if current is not None:
+                    gfx_clocks.append(current)
+                if ceiling is not None:
+                    max_clocks.append(ceiling)
+                state = info.get("clk_locked")
+                if isinstance(state, str) and state:
+                    locked.add(state)
+            if gfx_clocks:
+                low, high = min(gfx_clocks), max(gfx_clocks)
+                card["GFX Clock"] = (f"{low:g} MHz" if low == high
+                                     else f"{low:g}-{high:g} MHz across {len(gfx_clocks)} domains")
+                raw["gfx_clock_min_mhz"] = low
+                raw["gfx_clock_max_mhz"] = high
+            if max_clocks:
+                card["GFX Clock Limit"] = f"{max(max_clocks):g} MHz"
+                raw["gfx_clock_limit_mhz"] = max(max_clocks)
+            if locked:
+                card["Clock Locked"] = ", ".join(sorted(locked))
+
+        usage = row.get("usage")
+        if isinstance(usage, dict):
+            for key, label in (("gfx_activity", "GFX Utilization"),
+                               ("umc_activity", "Memory Utilization")):
+                value = _amd_smi_value(usage.get(key))
+                if value is not None:
+                    card[label] = f"{value:g} %"
+                    raw[key] = value
+
+        link = pcie_by_gpu.get(gpu_id, {}).get("pcie")
+        if isinstance(link, dict):
+            width = _int(link.get("width"))
+            speed = _pcie_speed_gts(link.get("speed"))
+            ceiling = maxima.get(gpu_id, {})
+            if width is not None:
+                card["PCIe Width (Current)"] = f"x{width}"
+                raw["pcie_width"] = width
+            if speed is not None:
+                card["PCIe Speed (Current)"] = f"{speed:g} GT/s"
+                raw["pcie_speed_gts"] = speed
+
+            # Caveat worth knowing before trusting a DEGRADED verdict: some
+            # platforms downtrain an idle link to save power, so a shortfall seen
+            # on an otherwise idle GPU is worth re-reading under load before it is
+            # treated as a seating defect. MI300X did not downtrain when measured.
+            shortfalls = []
+            max_width = ceiling.get("width")
+            max_speed = ceiling.get("speed")
+            if width is not None and max_width and width < max_width:
+                shortfalls.append(f"width x{width} of x{max_width:g}")
+            if speed is not None and max_speed and speed < max_speed:
+                shortfalls.append(f"speed {speed:g} of {max_speed:g} GT/s")
+            if shortfalls:
+                card["PCIe Link"] = "DEGRADED: " + ", ".join(shortfalls)
+                degraded_links.append(f"GPU {gpu_id}: {', '.join(shortfalls)}")
+                raw["pcie_degraded"] = True
+            elif width is not None or speed is not None:
+                card["PCIe Link"] = ("OK - trained to maximum" if (max_width or max_speed)
+                                     else "OK - no maximum reported for comparison")
+                raw["pcie_degraded"] = False
+
+            # Replays and NAKs accumulate only on signal-integrity problems, so
+            # unlike the throttle accumulators any nonzero value here is notable.
+            for key, label in (("replay_count", "PCIe Replay Count"),
+                               ("nak_sent_count", "PCIe NAKs Sent"),
+                               ("nak_received_count", "PCIe NAKs Received"),
+                               ("l0_to_recovery_count", "PCIe L0-to-Recovery Count")):
+                count = _int(link.get(key))
+                if count is not None:
+                    card[label] = str(count)
+                    raw[key] = count
+
+        throttle = violation_by_gpu.get(gpu_id, {}).get("throttle")
+        if isinstance(throttle, dict):
+            # The *_accumulated counters are lifetime residency totals and are
+            # routinely nonzero on a perfectly healthy GPU (a board that has ever
+            # touched its power limit has a nonzero ppt_accumulated forever), so
+            # they are reported as context. The *_violation_status fields are the
+            # actual present-tense signal and are the only thing flagged.
+            active = []
+            for key, value in throttle.items():
+                if not (isinstance(key, str) and key.endswith("_violation_status")):
+                    continue
+                if isinstance(value, str) and value.strip().upper() not in ("NOT ACTIVE", "N/A", ""):
+                    active.append(key[:-len("_violation_status")].replace("_", " "))
+            for key, label in (("ppt_accumulated", "Power Limit Residency"),
+                               ("socket_thermal_accumulated", "Socket Thermal Residency"),
+                               ("hbm_thermal_accumulated", "HBM Thermal Residency"),
+                               ("vr_thermal_accumulated", "VR Thermal Residency"),
+                               ("prochot_accumulated", "PROCHOT Residency")):
+                count = _int(throttle.get(key))
+                if count is not None:
+                    card[label] = str(count)
+                    raw[key] = count
+            if active:
+                card["Throttling"] = "ACTIVE: " + ", ".join(sorted(active))
+                active_violations.append(f"GPU {gpu_id}: {', '.join(sorted(active))}")
+                raw["throttling_active"] = True
+            else:
+                card["Throttling"] = "None active"
+                raw["throttling_active"] = False
+
+        if len(card) > 1:
+            card["_raw"] = raw
+            entries.append(card)
+
+    if entries:
+        summary: Dict[str, str] = OrderedDict()
+        summary["Section"] = "GPU Telemetry Summary"
+        summary["GPUs Sampled"] = str(len(entries))
+        summary["Degraded PCIe Links"] = ("; ".join(degraded_links) if degraded_links
+                                          else "None - all links trained to maximum")
+        summary["Active Throttling"] = ("; ".join(active_violations) if active_violations
+                                        else "None")
+        summary["Note"] = ("Point-in-time snapshot taken during collection, not a "
+                           "sustained-load measurement")
+        summary["_raw"] = {
+            "gpus_sampled": len(entries),
+            "degraded_pcie_links": len(degraded_links),
+            "active_throttle_violations": len(active_violations),
+        }
+        entries.insert(0, summary)
+
+    return OrderedDict([("linux", entries)]) if entries else OrderedDict()
+
+
+def _gpu_partition_entries() -> List[Dict[str, str]]:
+    """Accelerator (SPX/DPX/CPX) and memory (NPS) partition mode per GPU.
+
+    Partition mode is recorded as context, not as a correction to anything: rocminfo
+    enumerates one HSA agent per partition, so in CPX each agent already reports its
+    own CU count and the peak-performance math needs no rescaling. What this does
+    explain is why a CPX node appears to have more GPUs with fewer CUs each -- which
+    otherwise reads as a hardware discrepancy on a comparison report.
+    """
+    if platform.system().lower() != "linux":
+        return []
+
+    # `static --partition` first: `partition --json` only exists on newer amd-smi builds.
+    rows = _gpu_data_rows(_amd_smi_json(["static", "--partition"], record=False))
+    if not any(isinstance(row.get("partition"), dict) for row in rows):
+        rows = _gpu_data_rows(_amd_smi_json(["partition"], record=False))
+    if not rows:
+        return []
+
+    entries: List[Dict[str, str]] = []
+    modes = set()
+    memory_modes = set()
+
+    for position, row in enumerate(rows):
+        info = row.get("partition")
+        if not isinstance(info, dict):
+            continue
+        gpu_id = _gpu_index(row, position)
+        card: Dict[str, str] = OrderedDict()
+        card["Section"] = f"GPU {gpu_id} - Partition Mode"
+        raw: Dict[str, object] = {"gpu_id": gpu_id}
+
+        accelerator = info.get("accelerator_partition") or info.get("compute_partition")
+        memory = info.get("memory_partition")
+        if isinstance(accelerator, str) and accelerator:
+            card["Accelerator Partition"] = accelerator
+            raw["accelerator_partition"] = accelerator
+            modes.add(accelerator)
+        if isinstance(memory, str) and memory:
+            card["Memory Partition"] = memory
+            raw["memory_partition"] = memory
+            memory_modes.add(memory)
+        partition_id = _int(info.get("partition_id"))
+        if partition_id is not None:
+            card["Partition ID"] = str(partition_id)
+            raw["partition_id"] = partition_id
+        alloc = info.get("compute_partition_mem_alloc_mode")
+        if isinstance(alloc, str) and alloc:
+            card["Memory Allocation Mode"] = alloc
+
+        if len(card) > 1:
+            card["_raw"] = raw
+            entries.append(card)
+
+    if entries:
+        summary: Dict[str, str] = OrderedDict()
+        summary["Section"] = "GPU Partitioning Summary"
+        summary["Partitioned Devices"] = str(len(entries))
+        if modes:
+            summary["Accelerator Modes"] = ", ".join(sorted(modes))
+        if memory_modes:
+            summary["Memory Modes"] = ", ".join(sorted(memory_modes))
+        # A node running two different modes at once is legal but almost never
+        # intentional, and it invalidates any GPU-to-GPU comparison on the node.
+        if len(modes) > 1 or len(memory_modes) > 1:
+            summary["Status"] = ("ATTENTION: partition modes are not uniform across "
+                                 "the node; per-GPU results are not comparable")
+        else:
+            summary["Status"] = "Uniform across all devices"
+        summary["Note"] = ("Each partition is enumerated as its own device, so reported "
+                           "CU counts and peak figures are already per-partition")
+        summary["_raw"] = {
+            "partitioned_devices": len(entries),
+            "accelerator_modes": sorted(modes),
+            "memory_modes": sorted(memory_modes),
+            "uniform": len(modes) <= 1 and len(memory_modes) <= 1,
+        }
+        entries.insert(0, summary)
+
+    return entries
+
+
+def _platform_firmware_entry() -> Optional[Dict[str, str]]:
+    """BIOS and chassis identity from /sys/class/dmi/id.
+
+    dmidecode would give more (per-DIMM population, for one) but needs root, and
+    prompting for a password would hang an unattended collection. Everything here is
+    world-readable, so the common case -- "which BIOS is this node on?" -- is answered
+    without privilege. The fields root-only DMI would have added are listed as absent
+    rather than silently omitted.
+    """
+    fields = [
+        ("bios_vendor", "BIOS Vendor"),
+        ("bios_version", "BIOS Version"),
+        ("bios_date", "BIOS Date"),
+        ("sys_vendor", "System Vendor"),
+        ("product_name", "System Model"),
+        ("product_serial", "System Serial"),
+        ("board_vendor", "Baseboard Vendor"),
+        ("board_name", "Baseboard Model"),
+        ("chassis_vendor", "Chassis Vendor"),
+    ]
+    record: Dict[str, str] = OrderedDict()
+    record["Section"] = "Platform Firmware"
+    for name, label in fields:
+        value = _read_sysfs("/sys/class/dmi/id/" + name)
+        # Unpopulated DMI strings are these placeholders far more often than not.
+        if value and value.lower() not in ("to be filled by o.e.m.", "not specified",
+                                           "default string", "none", "unknown"):
+            record[label] = value
+    if len(record) == 1:
+        return None
+    record["DMI Detail Level"] = ("Unprivileged sysfs only; per-DIMM population and "
+                                  "slot inventory require root and were not collected")
+    return record
+
+
+def _platform_memory_entry() -> Optional[Dict[str, str]]:
+    """Memory controllers and their EDAC error counts.
+
+    EDAC is the host-side counterpart of the GPU ECC counters: correctable and
+    uncorrectable DIMM errors, readable without privilege.
+    """
+    base = "/sys/devices/system/edac/mc"
+    try:
+        controllers = sorted(name for name in os.listdir(base) if name.startswith("mc"))
+    except OSError:
+        return None
+    if not controllers:
+        return None
+
+    record: Dict[str, str] = OrderedDict()
+    record["Section"] = "Platform Memory (EDAC)"
+    record["Memory Controllers"] = str(len(controllers))
+    raw: Dict[str, object] = {"controllers": len(controllers)}
+
+    total_ce = 0
+    total_ue = 0
+    seen = False
+    for controller in controllers:
+        correctable = _int(_read_sysfs(os.path.join(base, controller, "ce_count")))
+        uncorrectable = _int(_read_sysfs(os.path.join(base, controller, "ue_count")))
+        if correctable is None and uncorrectable is None:
+            continue
+        seen = True
+        total_ce += correctable or 0
+        total_ue += uncorrectable or 0
+        record[f"{controller} Errors"] = (f"Correctable {correctable if correctable is not None else '?'}, "
+                                          f"Uncorrectable {uncorrectable if uncorrectable is not None else '?'}")
+    if seen:
+        record["Total Correctable Errors"] = str(total_ce)
+        record["Total Uncorrectable Errors"] = str(total_ue)
+        raw["edac_correctable"] = total_ce
+        raw["edac_uncorrectable"] = total_ue
+        record["Status"] = ("ATTENTION: host memory uncorrectable errors present"
+                            if total_ue else "OK - no host memory uncorrectable errors")
+        raw["healthy"] = not total_ue
+
+    size = _read_sysfs(os.path.join(base, controllers[0], "size_mb"))
+    if size:
+        record["Controller 0 Size"] = f"{size} MB"
+
+    record["_raw"] = raw
+    return record
+
+
+def _platform_numa_entry() -> Optional[Dict[str, str]]:
+    """NUMA node inventory and the inter-node distance matrix.
+
+    Distances matter on these hosts because a GPU's memory-staging buffer allocated
+    on the far node pays the penalty on every host-to-device transfer.
+    """
+    base = "/sys/devices/system/node"
+    try:
+        nodes = sorted((name for name in os.listdir(base)
+                        if name.startswith("node") and name[4:].isdigit()),
+                       key=lambda name: int(name[4:]))
+    except OSError:
+        return None
+    if not nodes:
+        return None
+
+    record: Dict[str, str] = OrderedDict()
+    record["Section"] = "Platform NUMA Topology"
+    record["NUMA Nodes"] = str(len(nodes))
+    raw: Dict[str, object] = {"numa_nodes": len(nodes)}
+
+    distances: List[List[int]] = []
+    for node in nodes:
+        cpulist = _read_sysfs(os.path.join(base, node, "cpulist"))
+        if cpulist:
+            record[f"{node} CPUs"] = cpulist
+        meminfo = _read_sysfs(os.path.join(base, node, "meminfo"))
+        if meminfo:
+            for line in meminfo.splitlines():
+                if "MemTotal" in line:
+                    record[f"{node} Memory"] = line.split(":", 1)[1].strip()
+                    break
+        distance = _read_sysfs(os.path.join(base, node, "distance"))
+        if distance:
+            row = [value for value in (_int(field) for field in distance.split())
+                   if value is not None]
+            if row:
+                distances.append(row)
+                record[f"{node} Distances"] = " ".join(str(value) for value in row)
+    if distances:
+        raw["numa_distances"] = distances
+        remote = [value for index, row in enumerate(distances)
+                  for position, value in enumerate(row) if index != position]
+        if remote:
+            raw["numa_max_distance"] = max(remote)
+
+    record["_raw"] = raw
+    return record
+
+
+def _platform_tuning_entry() -> Optional[Dict[str, str]]:
+    """Kernel and CPU settings that shape GPU host-side performance.
+
+    Reported, not graded. The right IOMMU mode depends on whether the node does
+    SR-IOV passthrough, and the right THP setting depends on the workload, so
+    encoding a pass/fail here would assert an opinion the tool has no basis for.
+    A human -- or a later assertion policy -- decides; this makes the state visible.
+    """
+    record: Dict[str, str] = OrderedDict()
+    record["Section"] = "Platform Tuning"
+
+    cmdline = _read_sysfs("/proc/cmdline")
+    if cmdline:
+        iommu = [token for token in cmdline.split()
+                 if "iommu" in token.lower()]
+        record["IOMMU Boot Parameters"] = " ".join(iommu) if iommu else "None specified"
+        mitigations = [token for token in cmdline.split()
+                       if token.startswith("mitigations=")]
+        if mitigations:
+            record["CPU Mitigations"] = " ".join(mitigations)
+        if len(cmdline) <= 500:
+            record["Kernel Command Line"] = cmdline
+
+    thp = _read_sysfs("/sys/kernel/mm/transparent_hugepage/enabled")
+    if thp:
+        # sysfs marks the active choice with brackets: "always [madvise] never".
+        active = [token.strip("[]") for token in thp.split() if token.startswith("[")]
+        record["Transparent Hugepages"] = active[0] if active else thp
+    defrag = _read_sysfs("/sys/kernel/mm/transparent_hugepage/defrag")
+    if defrag:
+        active = [token.strip("[]") for token in defrag.split() if token.startswith("[")]
+        if active:
+            record["Transparent Hugepage Defrag"] = active[0]
+
+    governor = _read_sysfs("/sys/devices/system/cpu/cpu0/cpufreq/scaling_governor")
+    if governor:
+        record["CPU Frequency Governor"] = governor
+    driver = _read_sysfs("/sys/devices/system/cpu/cpu0/cpufreq/scaling_driver")
+    if driver:
+        record["CPU Frequency Driver"] = driver
+    boost = _read_sysfs("/sys/devices/system/cpu/cpufreq/boost")
+    if boost is not None:
+        record["CPU Boost"] = {"1": "Enabled", "0": "Disabled"}.get(boost, boost)
+
+    idle_driver = _read_sysfs("/sys/devices/system/cpu/cpuidle/current_driver")
+    if idle_driver:
+        record["CPU Idle Driver"] = idle_driver
+
+    smt = _read_sysfs("/sys/devices/system/cpu/smt/control")
+    if smt:
+        record["SMT"] = smt
+
+    numa_balancing = _read_sysfs("/proc/sys/kernel/numa_balancing")
+    if numa_balancing is not None:
+        record["Automatic NUMA Balancing"] = {"1": "Enabled",
+                                              "0": "Disabled"}.get(numa_balancing, numa_balancing)
+
+    if len(record) == 1:
+        return None
+    record["Note"] = ("Settings are reported as found; the appropriate values depend on "
+                      "the deployment (for example SR-IOV hosts need full IOMMU translation)")
+    return record
+
+
+def _platform_affinity_entry() -> Optional[Dict[str, str]]:
+    """Which NUMA node each GPU and NIC is attached to.
+
+    A GPU on node 0 fed by a NIC on node 1 pays a cross-socket hop on every inbound
+    byte. The mapping is cheap to read and invisible in every other section.
+    """
+    record: Dict[str, str] = OrderedDict()
+    record["Section"] = "Platform Device Affinity"
+    raw: Dict[str, object] = {}
+
+    gpu_nodes: Dict[str, int] = OrderedDict()
+    try:
+        cards = sorted((name for name in os.listdir("/sys/class/drm")
+                        if name.startswith("card") and name[4:].isdigit()),
+                       key=lambda name: int(name[4:]))
+    except OSError:
+        cards = []
+    for card in cards:
+        node = _int(_read_sysfs(f"/sys/class/drm/{card}/device/numa_node"))
+        vendor = _read_sysfs(f"/sys/class/drm/{card}/device/vendor")
+        # 0x1002 is AMD; other vendors' display adapters are not what this is about.
+        if node is None or node < 0 or vendor != "0x1002":
+            continue
+        gpu_nodes[card] = node
+        record[f"GPU {card}"] = f"NUMA node {node}"
+    if gpu_nodes:
+        raw["gpu_numa_nodes"] = dict(gpu_nodes)
+
+    nic_nodes: Dict[str, int] = OrderedDict()
+    try:
+        interfaces = sorted(os.listdir("/sys/class/net"))
+    except OSError:
+        interfaces = []
+    for interface in interfaces:
+        if interface == "lo":
+            continue
+        node = _int(_read_sysfs(f"/sys/class/net/{interface}/device/numa_node"))
+        if node is None or node < 0:
+            continue
+        nic_nodes[interface] = node
+        record[f"NIC {interface}"] = f"NUMA node {node}"
+    if nic_nodes:
+        raw["nic_numa_nodes"] = dict(nic_nodes)
+
+    if not gpu_nodes and not nic_nodes:
+        return None
+
+    if gpu_nodes and nic_nodes:
+        gpu_set = set(gpu_nodes.values())
+        nic_set = set(nic_nodes.values())
+        if gpu_set & nic_set:
+            record["GPU/NIC Locality"] = (
+                f"Shared NUMA node(s): {', '.join(str(node) for node in sorted(gpu_set & nic_set))}")
+        else:
+            record["GPU/NIC Locality"] = (
+                f"No shared NUMA node: GPUs on {sorted(gpu_set)}, NICs on {sorted(nic_set)}; "
+                f"host-staged transfers cross sockets")
+        raw["gpu_nic_share_numa"] = bool(gpu_set & nic_set)
+
+    record["_raw"] = raw
+    return record
+
+
+def gather_platform_details() -> Dict[str, List[Dict[str, str]]]:
+    """Host firmware, memory, NUMA, tuning and device-affinity state.
+
+    Fills rapido's largest blind spot: everything it reported was about the GPUs and
+    nothing about the machine they sit in, so a node that underperformed because of a
+    stale BIOS, a wrong NUMA placement or a power-saving governor looked identical to
+    a healthy one. Unprivileged sources only -- no sudo, nothing that can block an
+    unattended run on a password prompt.
+    """
+    if platform.system().lower() != "linux":
+        return OrderedDict()
+
+    entries = [entry for entry in (
+        _platform_firmware_entry(),
+        _platform_memory_entry(),
+        _platform_numa_entry(),
+        _platform_tuning_entry(),
+        _platform_affinity_entry(),
+    ) if entry]
+
+    return OrderedDict([("linux", entries)]) if entries else OrderedDict()
+
+
 def gather_gpu_details() -> Dict[str, List[Dict[str, str]]]:
     system = platform.system().lower()
     details: Dict[str, List[Dict[str, str]]] = OrderedDict()
@@ -908,6 +1837,9 @@ def gather_gpu_details() -> Dict[str, List[Dict[str, str]]]:
         adapters = mac_gpu_info()
         if adapters:
             details["macos"] = adapters
+    partitions = _gpu_partition_entries()
+    if partitions:
+        details.setdefault("linux", []).extend(partitions)
     generic = generic_gpu_info()
     if generic:
         details["generic"] = generic
@@ -1884,8 +2816,178 @@ def _build_peak_performance_cards(gpu_key: str, gfx_version: Optional[str], comp
     return cards
 
 
-def gather_gpu_microbenchmarks(include_p2p: bool = False, verbose: bool = True) -> Dict[str, List[Dict[str, str]]]:
-    """Gather GPU microbenchmark information including peak performance and optionally GPU-to-GPU communication."""
+def _dense_matrix_peaks(cards: List[Dict[str, str]]) -> Dict[str, float]:
+    """Theoretical dense *matrix* peak TFLOPS per precision, from the peak cards.
+
+    Matrix rather than vector rates, because rocBLAS dispatches to the matrix cores;
+    comparing a library GEMM against the vector peak would report efficiencies well
+    above 100% and mean nothing. The peak cards are per GPU model, and the efficiency
+    comparison below assumes the node is homogeneous -- which every other per-GPU
+    comparison in this tool already assumes.
+    """
+    peaks: Dict[str, float] = {}
+    for card in cards:
+        if not isinstance(card, dict):
+            continue
+        raw = card.get("_raw")
+        if not isinstance(raw, dict):
+            continue
+        matrix = raw.get("peak_matrix_tflops")
+        if not isinstance(matrix, dict):
+            continue
+        for precision, value in matrix.items():
+            number = _num(value)
+            if number:
+                peaks[str(precision).upper()] = number
+    return peaks
+
+
+def _build_library_gemm_cards(data: Dict, peak_cards: List[Dict[str, str]]) -> List[Dict[str, str]]:
+    """Cards for the rocBLAS GEMM results, including efficiency against theoretical peak.
+
+    Efficiency is the point of this benchmark. An absolute TFLOPS figure means nothing
+    without the peak it is being measured against, and until Tier 1 fixed the peak model
+    rapido could not compute that ratio honestly for any precision.
+    """
+    model_peaks = _dense_matrix_peaks(peak_cards)
+    cards: List[Dict[str, str]] = []
+
+    for result in data.get("results", []):
+        if not isinstance(result, dict):
+            continue
+        gpu_id = result.get("gpu_id", "?")
+        card: Dict[str, str] = OrderedDict()
+        card["Section"] = f"GPU {gpu_id} Library GEMM (rocBLAS)"
+        card["GPU Architecture"] = str(result.get("gpu_name", "Unknown"))
+        card["Library"] = str(result.get("library", "rocBLAS"))
+        raw: Dict[str, object] = {"gpu_id": gpu_id}
+
+        # Keep only the best result per precision: smaller matrices are included to
+        # cover partitioned GPUs with less memory, not to be reported separately.
+        best: Dict[str, Dict] = {}
+        for measurement in result.get("measurements", []):
+            if not isinstance(measurement, dict):
+                continue
+            precision = str(measurement.get("precision", ""))
+            tflops = _num(measurement.get("tflops"))
+            if not precision or tflops is None:
+                continue
+            if precision not in best or tflops > (_num(best[precision].get("tflops")) or 0.0):
+                best[precision] = measurement
+
+        for precision in sorted(best):
+            measurement = best[precision]
+            tflops = _num(measurement.get("tflops")) or 0.0
+            size = _int(measurement.get("size"))
+            label = f"{tflops:.2f} TFLOPS"
+            if size:
+                label += f" at {size}x{size}"
+            peak = model_peaks.get(precision)
+            if peak:
+                efficiency = tflops / peak * 100.0
+                label += f" ({efficiency:.1f}% of {peak:.1f} TFLOPS peak)"
+                raw[f"gemm_{precision.lower()}_efficiency_pct"] = round(efficiency, 2)
+            card[f"Achieved GEMM {precision}"] = label
+            raw[f"gemm_{precision.lower()}_tflops"] = tflops
+
+        if len(card) > 3:
+            card["_raw"] = raw
+            cards.append(card)
+
+    return cards
+
+
+def _build_rccl_cards(data: Dict) -> List[Dict[str, str]]:
+    """Cards for the RCCL collective results.
+
+    Bus bandwidth is reported alongside the algorithm bandwidth because only the
+    former is comparable to the fabric's link rate; the algorithm figure is what the
+    application sees and the two differ by a factor that depends on the rank count.
+    """
+    ranks = _int(data.get("ranks"))
+    results = data.get("results", [])
+    if not isinstance(results, list) or not results:
+        return []
+
+    cards: List[Dict[str, str]] = []
+    by_collective: Dict[str, List[Dict]] = OrderedDict()
+    for entry in results:
+        if isinstance(entry, dict) and entry.get("collective"):
+            by_collective.setdefault(str(entry["collective"]), []).append(entry)
+
+    summary: Dict[str, str] = OrderedDict()
+    summary["Section"] = "RCCL Collective Bandwidth"
+    if ranks:
+        summary["Ranks"] = str(ranks)
+    version = _int(data.get("rccl_version"))
+    if version:
+        # RCCL reports its version packed as major*10000 + minor*100 + patch.
+        summary["RCCL Version"] = (f"{version // 10000}.{(version // 100) % 100}."
+                                   f"{version % 100}")
+    raw: Dict[str, object] = {"ranks": ranks}
+
+    for collective, entries in by_collective.items():
+        peak = max(entries, key=lambda e: _num(e.get("bus_gbps")) or 0.0)
+        bus = _num(peak.get("bus_gbps"))
+        algorithm = _num(peak.get("algorithm_gbps"))
+        size_mb = (_num(peak.get("bytes")) or 0.0) / (1024 * 1024)
+        if bus is None:
+            continue
+        summary[collective] = (f"{bus:.2f} GB/s bus bandwidth "
+                               f"({algorithm:.2f} GB/s algorithm) at {size_mb:.0f} MB"
+                               if algorithm is not None else f"{bus:.2f} GB/s bus bandwidth")
+        raw[f"rccl_{collective.lower()}_bus_gbps"] = bus
+        if algorithm is not None:
+            raw[f"rccl_{collective.lower()}_algorithm_gbps"] = algorithm
+
+    if len(summary) <= 1:
+        return []
+    summary["Note"] = ("Measured across all visible GPUs in one process via "
+                       "ncclCommInitAll; bus bandwidth applies the standard "
+                       "rank-count correction and is what compares to the link rate")
+    summary["_raw"] = raw
+    cards.append(summary)
+
+    detail: Dict[str, str] = OrderedDict()
+    detail["Section"] = "RCCL Collective Bandwidth by Message Size"
+    for entry in results:
+        if not isinstance(entry, dict):
+            continue
+        bus = _num(entry.get("bus_gbps"))
+        size_mb = (_num(entry.get("bytes")) or 0.0) / (1024 * 1024)
+        if bus is None:
+            continue
+        detail[f"{entry.get('collective')} {size_mb:.0f} MB"] = f"{bus:.2f} GB/s bus bandwidth"
+    if len(detail) > 1:
+        cards.append(detail)
+
+    return cards
+
+
+def _rccl_available() -> bool:
+    """Whether RCCL is present to link against.
+
+    Detection is by library and header on disk, not by running anything: RCCL is a
+    shared library with no executable, so the usual check_tool_availability() probe
+    would report it missing on every node that has it.
+    """
+    rocm_path = os.environ.get("ROCM_PATH") or "/opt/rocm"
+    for directory in (os.path.join(rocm_path, "lib"), os.path.join(rocm_path, "lib64"),
+                      "/usr/lib/x86_64-linux-gnu", "/usr/lib64"):
+        if os.path.exists(os.path.join(directory, "librccl.so")):
+            return True
+    return False
+
+
+def gather_gpu_microbenchmarks(include_p2p: bool = False, verbose: bool = True,
+                               full: bool = False) -> Dict[str, List[Dict[str, str]]]:
+    """Gather GPU microbenchmark information including peak performance and optionally GPU-to-GPU communication.
+
+    Pass full=True to additionally run the heavyweight library benchmarks (rocBLAS
+    GEMM and RCCL collectives). They are gated because together they add several
+    minutes and saturate every GPU on the node, which is not acceptable by default
+    on a machine that may be running someone else's job.
+    """
     details: Dict[str, List[Dict[str, str]]] = OrderedDict()
     system = platform.system().lower()
 
@@ -2508,6 +3610,110 @@ def gather_gpu_microbenchmarks(include_p2p: bool = False, verbose: bool = True) 
                     error_info["Message"] = f"JSON parsing failed: {str(e)}"
                     microbenchmark_list.append(error_info)
 
+    # Heavyweight library benchmarks, only under --full. Both saturate every GPU on
+    # the node, so they must never run by default on a machine that might be busy.
+    if full:
+        # Snapshot the peak cards before appending: the GEMM efficiency ratio reads
+        # them, and they are all that is in the list at this point that carries peaks.
+        peak_cards = list(microbenchmark_list)
+
+        gemm_cpp_file = os.path.join(script_dir, "gpu_gemm_library.cpp")
+        gemm_exe_file = os.path.join(script_dir, "gpu_gemm_library")
+        if os.path.exists(gemm_cpp_file):
+            if verbose:
+                print(f"Compiling library GEMM benchmark: {gemm_cpp_file}")
+            compile_result = run_command(
+                ["hipcc", "-O3", "-o", gemm_exe_file, gemm_cpp_file, "-lrocblas"],
+                timeout=COMPILE_TIMEOUT)
+
+            if compile_result is None and not os.path.exists(gemm_exe_file):
+                error_info = OrderedDict()
+                error_info["Section"] = "Library GEMM - Error"
+                error_info["Message"] = ("Failed to compile (rocBLAS development files "
+                                         "may not be installed)")
+                microbenchmark_list.append(error_info)
+            else:
+                if verbose:
+                    print(f"Running library GEMM benchmark: {gemm_exe_file}")
+                gemm_output = run_command([gemm_exe_file], timeout=BENCHMARK_TIMEOUT,
+                                          env=_hip_runtime_env())
+                if not gemm_output:
+                    error_info = OrderedDict()
+                    error_info["Section"] = "Library GEMM - Error"
+                    error_info["Message"] = "Benchmark execution failed or produced no output"
+                    microbenchmark_list.append(error_info)
+                else:
+                    try:
+                        json_start = gemm_output.find("{")
+                        data = json.loads(gemm_output[json_start:]) if json_start != -1 else {}
+                        if "error" in data:
+                            error_info = OrderedDict()
+                            error_info["Section"] = "Library GEMM - Error"
+                            error_info["Status"] = data["error"]
+                            microbenchmark_list.append(error_info)
+                        else:
+                            microbenchmark_list.extend(
+                                _build_library_gemm_cards(data, peak_cards))
+                    except json.JSONDecodeError as e:
+                        error_info = OrderedDict()
+                        error_info["Section"] = "Library GEMM - Error"
+                        error_info["Message"] = f"JSON parsing failed: {str(e)}"
+                        microbenchmark_list.append(error_info)
+
+        rccl_cpp_file = os.path.join(script_dir, "gpu_rccl_collectives.cpp")
+        rccl_exe_file = os.path.join(script_dir, "gpu_rccl_collectives")
+        if os.path.exists(rccl_cpp_file):
+            if not _rccl_available():
+                error_info = OrderedDict()
+                error_info["Section"] = "RCCL Collectives - Skipped"
+                error_info["Message"] = ("librccl.so not found; install RCCL to measure "
+                                         "collective bandwidth")
+                microbenchmark_list.append(error_info)
+            else:
+                if verbose:
+                    print(f"Compiling RCCL collectives benchmark: {rccl_cpp_file}")
+                compile_result = run_command(
+                    ["hipcc", "-O3", "-o", rccl_exe_file, rccl_cpp_file, "-lrccl"],
+                    timeout=COMPILE_TIMEOUT)
+
+                if compile_result is None and not os.path.exists(rccl_exe_file):
+                    error_info = OrderedDict()
+                    error_info["Section"] = "RCCL Collectives - Error"
+                    error_info["Message"] = "Failed to compile (RCCL headers may not be installed)"
+                    microbenchmark_list.append(error_info)
+                else:
+                    if verbose:
+                        print(f"Running RCCL collectives benchmark: {rccl_exe_file}")
+                    rccl_output = run_command([rccl_exe_file], timeout=BENCHMARK_TIMEOUT,
+                                              env=_hip_runtime_env())
+                    if not rccl_output:
+                        error_info = OrderedDict()
+                        error_info["Section"] = "RCCL Collectives - Error"
+                        error_info["Message"] = "Benchmark execution failed or produced no output"
+                        microbenchmark_list.append(error_info)
+                    else:
+                        try:
+                            json_start = rccl_output.find("{")
+                            data = json.loads(rccl_output[json_start:]) if json_start != -1 else {}
+                            if "skipped" in data:
+                                # A single-GPU host is a valid configuration, not a fault.
+                                info = OrderedDict()
+                                info["Section"] = "RCCL Collectives - Skipped"
+                                info["Message"] = data["skipped"]
+                                microbenchmark_list.append(info)
+                            elif "error" in data:
+                                error_info = OrderedDict()
+                                error_info["Section"] = "RCCL Collectives - Error"
+                                error_info["Status"] = data["error"]
+                                microbenchmark_list.append(error_info)
+                            else:
+                                microbenchmark_list.extend(_build_rccl_cards(data))
+                        except json.JSONDecodeError as e:
+                            error_info = OrderedDict()
+                            error_info["Section"] = "RCCL Collectives - Error"
+                            error_info["Message"] = f"JSON parsing failed: {str(e)}"
+                            microbenchmark_list.append(error_info)
+
     if microbenchmark_list:
         details["linux"] = microbenchmark_list
 
@@ -2836,16 +4042,28 @@ def _parse_args() -> argparse.Namespace:
         help="Collect GPU microbenchmarks only (automatically includes ROCm info)",
     )
     parser.add_argument(
+        "-t",
+        "--platform",
+        action="store_true",
+        help="Collect host platform information only (BIOS/DMI, EDAC, NUMA, kernel tuning, GPU/NIC affinity)",
+    )
+    parser.add_argument(
         "-a",
         "--all",
         action="store_true",
-        help="Collect all basic information: CPU, GPU, Network, BMC, ROCm (does NOT include microbenchmarks - use -m)",
+        help="Collect all basic information: CPU, GPU, Network, BMC, ROCm, Platform (does NOT include microbenchmarks - use -m)",
     )
     parser.add_argument(
         "-p",
         "--p2p",
         action="store_true",
         help="Include GPU-to-GPU peer-to-peer communication bandwidth tests (requires -m flag)",
+    )
+    parser.add_argument(
+        "--full",
+        action="store_true",
+        help="Run the heavy library benchmarks as well: rocBLAS achieved GEMM and RCCL collectives "
+             "(requires -m flag; adds several minutes to the run)",
     )
     parser.add_argument(
         "-v",
@@ -2877,13 +4095,15 @@ def main() -> None:
 
     # Determine which sections to collect
     # If no specific flags are provided, or -a is used, collect all basic sections (NOT microbenchmarks)
-    collect_all = args.all or not (args.cpu or args.gpu or args.network or args.bmc or args.rocm or args.microbenchmarks)
-    
+    collect_all = args.all or not (args.cpu or args.gpu or args.network or args.bmc or args.rocm
+                                   or args.platform or args.microbenchmarks)
+
     collect_cpu = collect_all or args.cpu
     collect_gpu = collect_all or args.gpu
     collect_network = collect_all or args.network
     collect_bmc = collect_all or args.bmc
     collect_rocm = collect_all or args.rocm or args.microbenchmarks  # ROCm is collected with microbenchmarks
+    collect_platform = collect_all or args.platform
     # Microbenchmarks ONLY run when explicitly requested with -m flag
     collect_microbenchmarks = args.microbenchmarks
 
@@ -2895,7 +4115,15 @@ def main() -> None:
         if args.verbose:
             print("Warning: -p/--p2p flag requires -m/--microbenchmarks flag to be effective")
             print("GPU P2P communication tests will be skipped. Use: python rapido-collect.py -m -p")
-    
+
+    # Same reasoning as -p: --full only selects extra benchmarks, it does not turn
+    # benchmarking on, so on its own it does nothing and the user should hear about it.
+    if args.full and not collect_microbenchmarks:
+        if args.verbose:
+            print("Warning: --full flag requires -m/--microbenchmarks flag to be effective")
+            print("Library GEMM and RCCL collective tests will be skipped. Use: python rapido-collect.py -m --full")
+
+
     if args.verbose:
         print("Starting data collection...")
         print()
@@ -2906,6 +4134,9 @@ def main() -> None:
     network_details = {}
     bmc_details = {}
     rocm_details = {}
+    ras_details = {}
+    telemetry_details = {}
+    platform_details = {}
     microbenchmark_details = {}
     collection_errors = []
     
@@ -2925,7 +4156,35 @@ def main() -> None:
                 collection_errors.append(f"GPU collection failed: {str(e)}")
                 if args.verbose:
                     print(f"Warning: GPU collection failed: {str(e)}")
-        
+
+            # RAS and telemetry are separate try blocks, not part of the one above:
+            # they are independent amd-smi subcommands, and losing the whole GPU
+            # inventory because one counter query misbehaved would be a bad trade.
+            try:
+                ras_details = gather_ras_health()
+            except Exception as e:
+                collection_errors.append(f"RAS health collection failed: {str(e)}")
+                if args.verbose:
+                    print(f"Warning: RAS health collection failed: {str(e)}")
+
+            try:
+                # gpu_details supplies the max PCIe width/speed that the current
+                # trained link is compared against, so this must run after it.
+                telemetry_details = gather_gpu_telemetry(gpu_details)
+            except Exception as e:
+                collection_errors.append(f"GPU telemetry collection failed: {str(e)}")
+                if args.verbose:
+                    print(f"Warning: GPU telemetry collection failed: {str(e)}")
+
+        if collect_platform:
+            try:
+                platform_details = gather_platform_details()
+            except Exception as e:
+                collection_errors.append(f"Platform collection failed: {str(e)}")
+                if args.verbose:
+                    print(f"Warning: Platform collection failed: {str(e)}")
+
+
         if collect_network:
             try:
                 network_details = gather_network_details()
@@ -2952,7 +4211,8 @@ def main() -> None:
         
         if collect_microbenchmarks:
             try:
-                microbenchmark_details = gather_gpu_microbenchmarks(include_p2p=args.p2p, verbose=args.verbose)
+                microbenchmark_details = gather_gpu_microbenchmarks(
+                    include_p2p=args.p2p, verbose=args.verbose, full=args.full)
             except Exception as e:
                 collection_errors.append(f"Microbenchmark collection failed: {str(e)}")
                 if args.verbose:
@@ -2999,6 +4259,15 @@ def main() -> None:
         payload["rocm"] = rocm_details
     else:
         payload["rocm"] = []
+    # Unlike the sections above, these are omitted entirely when empty rather than
+    # written as []: an absent key makes the report drop the tab, whereas an empty
+    # list on a host without amd-smi would render an empty tab that looks broken.
+    if ras_details:
+        payload["ras"] = ras_details
+    if telemetry_details:
+        payload["telemetry"] = telemetry_details
+    if platform_details:
+        payload["platform"] = platform_details
     if microbenchmark_details:
         payload["microbenchmarks"] = microbenchmark_details
 
