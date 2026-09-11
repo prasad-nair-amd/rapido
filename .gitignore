@@ -1,0 +1,11 @@
+__pycache__/
+*.py[cod]
+
+# Benchmark binaries compiled on demand by rapido-collect.py
+/gpu_kernel_benchmarks
+/gpu_p2p_bandwidth
+/gpu_host_bandwidth
+/gpu_topology
+
+# Collected data and generated reports
+serverinfo_*.json

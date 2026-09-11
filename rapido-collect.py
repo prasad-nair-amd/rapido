@@ -9,7 +9,45 @@ import sys
 from collections import OrderedDict
 from typing import Dict, List, Optional
 
-def run_command(cmd: List[str]) -> Optional[str]:
+# Default wall-clock limit for a single external command. Without this a single hung tool
+# (amd-smi against a wedged GPU, ipmitool against an unresponsive BMC) blocks the whole run.
+DEFAULT_COMMAND_TIMEOUT = 60
+
+# Compiling a HIP source and running the GPU benchmarks legitimately take minutes
+# (P2P alone is N^2 GPU pairs), so those calls pass these larger limits explicitly.
+COMPILE_TIMEOUT = 600
+BENCHMARK_TIMEOUT = 1800
+
+# Records why each command failed, so the report can distinguish "tool missing" from
+# "tool timed out" from "tool returned an error". Keyed by the command name.
+COMMAND_FAILURES: "OrderedDict[str, Dict[str, str]]" = OrderedDict()
+
+
+def _safe_hostname() -> str:
+    """This machine's hostname, or "" if it cannot be determined."""
+    try:
+        return socket.gethostname() or ""
+    except Exception:
+        return ""
+
+
+def run_command(cmd: List[str], timeout: Optional[int] = DEFAULT_COMMAND_TIMEOUT,
+                record: bool = True) -> Optional[str]:
+    """Run an external command and return its stdout, or None on any failure.
+
+    Failures are recorded in COMMAND_FAILURES with a reason so the caller (and ultimately the
+    report) can tell a missing tool apart from a hung or erroring one. Pass a larger timeout
+    for long-running work such as compiling or running the GPU benchmarks.
+
+    Pass record=False for speculative probes (does this tool exist? does it accept --version?)
+    whose failure is expected and not worth surfacing in the report.
+    """
+    key = " ".join(cmd)
+
+    def fail(reason: str, detail: str) -> None:
+        if record:
+            COMMAND_FAILURES[key] = {"reason": reason, "detail": detail}
+
     try:
         result = subprocess.run(
             cmd,
@@ -17,9 +55,30 @@ def run_command(cmd: List[str]) -> Optional[str]:
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             universal_newlines=True,  # text=True equivalent for Python 3.6 compatibility
+            timeout=timeout,
         )
+        # A command that succeeds now supersedes any earlier failure of the same
+        # command, so a stale record cannot outlive the condition it described.
+        COMMAND_FAILURES.pop(key, None)
         return result.stdout.strip()
-    except (subprocess.SubprocessError, FileNotFoundError):
+    except subprocess.TimeoutExpired:
+        fail("timeout", f"No response after {timeout}s")
+        return None
+    except FileNotFoundError:
+        fail("not_found", f"Command not found: {cmd[0]}")
+        return None
+    except subprocess.CalledProcessError as e:
+        stderr = (e.stderr or "").strip()
+        fail("error", f"Exit code {e.returncode}"
+                      + (f": {stderr.splitlines()[0][:200]}" if stderr else ""))
+        return None
+    except subprocess.SubprocessError as e:
+        fail("error", str(e)[:200])
+        return None
+    except OSError as e:
+        # PermissionError, ENOEXEC and friends are OSError but not SubprocessError,
+        # and would otherwise escape and abort the whole collection.
+        fail("error", f"{type(e).__name__}: {str(e)[:200]}")
         return None
 
 def check_tool_availability(verbose: bool = True) -> None:
@@ -114,17 +173,20 @@ def check_tool_availability(verbose: bool = True) -> None:
             print("-" * 80)
         
         for tool_cmd, tool_name, impact in tools:
-            # Check if tool exists
-            result = run_command([tool_cmd, "--version"]) if system != "windows" else run_command([tool_cmd, "/?"])
-            
+            # Check if tool exists. These are probes, not data collection: a tool
+            # that is simply absent, or that does not accept --version, is an
+            # expected outcome and must not land in COMMAND_FAILURES.
+            result = (run_command([tool_cmd, "--version"], record=False) if system != "windows"
+                      else run_command([tool_cmd, "/?"], record=False))
+
             # Some tools don't support --version, try different approaches
             if result is None:
                 if tool_cmd in ["ip", "ethtool", "ipmitool"]:
-                    result = run_command([tool_cmd])
+                    result = run_command([tool_cmd], record=False)
                 elif tool_cmd == "system_profiler":
-                    result = run_command(["which", tool_cmd])
+                    result = run_command(["which", tool_cmd], record=False)
                 elif tool_cmd in ["dpkg", "rpm"]:
-                    result = run_command(["which", tool_cmd])
+                    result = run_command(["which", tool_cmd], record=False)
             
             if verbose:
                 status = "[+]" if result is not None else "[x]"
@@ -1523,6 +1585,225 @@ def gather_bmc_info() -> Dict[str, List[Dict[str, str]]]:
 
     return details
 
+# Peak theoretical throughput expressed as FLOPS (or OPS) per compute unit per clock.
+# This is the architecture-intrinsic form: TFLOPS = CUs * flops_per_cu_per_clock * clock_MHz / 1e6.
+#
+# Verified against AMD published peak figures, e.g.:
+#   MI300X  (gfx942, 304 CU @ 2100 MHz): FP64 vec 128 -> 81.7 TFLOPS, FP32 vec 256 -> 163.4,
+#                                        FP16 mat 2048 -> 1307.4, FP8 mat 4096 -> 2614.9
+#   MI355X  (gfx950, 256 CU @ 2400 MHz): FP64 vec 128 -> 78.6 TFLOPS, FP16 mat 4096 -> 2516.6
+#   MI250X  (gfx90a, 220 CU @ 1700 MHz): FP64 vec 128 -> 47.9 TFLOPS, FP16 mat 1024 -> 383.0
+#
+# Notes:
+#   - "vector" and "matrix" rates are tracked separately; they differ on CDNA (e.g. CDNA3 FP64
+#     matrix is 2x its vector rate, while CDNA4 halves FP64 matrix relative to CDNA3).
+#   - TF32 is a real CDNA3 matrix format, but CDNA4 removed the hardware path (emulated via BF16),
+#     so it is only listed for gfx94x. It was never present on CDNA1/CDNA2 or RDNA.
+#   - "sparse" lists the precisions that support 2:4 structured sparsity at 2x the dense matrix
+#     rate. CDNA2 has no structured sparsity support; CDNA4 dropped it for FP32/FP64.
+GPU_ARCH_PEAK_TABLE = {
+    # CDNA4 - MI350X / MI355X
+    "gfx950": {
+        "name": "CDNA4",
+        "vector": {"FP64": 128, "FP32": 256},
+        "matrix": {"FP64": 128, "FP32": 256, "BF16": 4096, "FP16": 4096,
+                   "FP8": 8192, "INT8": 8192, "FP6": 16384, "FP4": 16384},
+        "sparse": ["BF16", "FP16", "FP8", "INT8", "FP6", "FP4"],
+    },
+    # CDNA3 - MI300A / MI300X / MI325X
+    "gfx942": {
+        "name": "CDNA3",
+        "vector": {"FP64": 128, "FP32": 256},
+        "matrix": {"FP64": 256, "FP32": 256, "TF32": 1024, "BF16": 2048,
+                   "FP16": 2048, "FP8": 4096, "INT8": 4096},
+        "sparse": ["TF32", "BF16", "FP16", "FP8", "INT8"],
+    },
+    # CDNA2 - MI210 / MI250 / MI250X. No structured sparsity.
+    "gfx90a": {
+        "name": "CDNA2",
+        "vector": {"FP64": 128, "FP32": 128},
+        "matrix": {"FP64": 256, "FP32": 256, "BF16": 1024, "FP16": 1024, "INT8": 1024},
+        "sparse": [],
+    },
+    # CDNA1 - MI100
+    "gfx908": {
+        "name": "CDNA1",
+        "vector": {"FP64": 64, "FP32": 128},
+        # CDNA1 runs BF16 MFMA at half the FP16 rate (K=4 vs K=8);
+        # BF16 only reaches FP16 parity from CDNA2 onwards.
+        "matrix": {"FP32": 256, "BF16": 512, "FP16": 1024, "INT8": 1024},
+        "sparse": [],
+    },
+    # GCN5 (Vega) - MI50 / MI60
+    "gfx906": {
+        "name": "GCN5",
+        "vector": {"FP64": 64, "FP32": 128},
+        "matrix": {},
+        "sparse": [],
+    },
+    "gfx900": {
+        "name": "GCN5",
+        "vector": {"FP64": 8, "FP32": 128},
+        "matrix": {},
+        "sparse": [],
+    },
+}
+
+# gfx940/gfx941 are pre-production CDNA3 variants sharing the gfx942 rates.
+GPU_ARCH_PEAK_TABLE["gfx940"] = GPU_ARCH_PEAK_TABLE["gfx942"]
+GPU_ARCH_PEAK_TABLE["gfx941"] = GPU_ARCH_PEAK_TABLE["gfx942"]
+
+
+def _lookup_gpu_arch(gfx_version: Optional[str]) -> Optional[Dict]:
+    """Resolve a gfx version string (e.g. 'gfx942:sramecc+:xnack-') to its peak-rate table entry."""
+    if not gfx_version:
+        return None
+    gfx = gfx_version.lower()
+    # Match the longest key first so gfx9xx variants cannot shadow a more specific entry.
+    for key in sorted(GPU_ARCH_PEAK_TABLE, key=len, reverse=True):
+        if key in gfx:
+            return GPU_ARCH_PEAK_TABLE[key]
+    return None
+
+
+def compute_peak_performance(gfx_version: Optional[str], compute_units: int,
+                             clock_mhz: float) -> Dict[str, Dict[str, float]]:
+    """Compute peak theoretical throughput in TFLOPS/TOPS for a GPU.
+
+    Returns a dict with 'vector', 'matrix' and 'sparse' sub-dicts mapping precision -> TFLOPS,
+    plus an 'arch' name. Returns an empty 'arch' when the architecture is unknown, so callers
+    can say so explicitly rather than silently reporting a fabricated number.
+    """
+    arch = _lookup_gpu_arch(gfx_version)
+    if not arch or not compute_units or not clock_mhz:
+        return {"arch": None, "vector": {}, "matrix": {}, "sparse": {}}
+
+    def scale(rates: Dict[str, int]) -> Dict[str, float]:
+        return {
+            precision: (compute_units * per_clock * clock_mhz) / 1e6
+            for precision, per_clock in rates.items()
+        }
+
+    matrix = scale(arch["matrix"])
+    sparse = {p: matrix[p] * 2 for p in arch["sparse"] if p in matrix}
+
+    return {
+        "arch": arch["name"],
+        "vector": scale(arch["vector"]),
+        "matrix": matrix,
+        "sparse": sparse,
+    }
+
+
+def _build_p2p_matrix_card(pairs: List[Dict]) -> Optional[Dict]:
+    """Fold the per-pair P2P results into a single N x N bandwidth matrix card.
+
+    The per-pair cards stay as they are; this adds one card the report can draw a
+    heatmap from without having to re-parse 56 separate sections.
+    """
+    ids = sorted({p[k] for p in pairs for k in ("src_gpu", "dst_gpu")
+                  if isinstance(p[k], int)})
+    if not ids:
+        return None
+
+    index = {gpu: i for i, gpu in enumerate(ids)}
+    n = len(ids)
+    bandwidth = [[None] * n for _ in range(n)]
+    enabled = [[None] * n for _ in range(n)]
+    for p in pairs:
+        src, dst = p["src_gpu"], p["dst_gpu"]
+        if src in index and dst in index:
+            bandwidth[index[src]][index[dst]] = p["bandwidth_gbps"]
+            enabled[index[src]][index[dst]] = p["p2p_enabled"]
+
+    # Summarise the matrix itself, not the raw pair list: a pair whose GPU ids did
+    # not make it into the index is absent from the heatmap, so counting it here
+    # would make the stats disagree with the picture they sit above.
+    measured = [v for row in bandwidth for v in row if v]
+
+    card = OrderedDict()
+    card["Section"] = "GPU P2P Bandwidth Matrix"
+    card["GPU Count"] = str(n)
+    card["Measured Links"] = str(len(measured))
+    if measured:
+        card["Min Bandwidth"] = f"{min(measured):.2f} GB/s"
+        card["Max Bandwidth"] = f"{max(measured):.2f} GB/s"
+        card["Mean Bandwidth"] = f"{sum(measured) / len(measured):.2f} GB/s"
+    card["_raw"] = {
+        "gpu_ids": ids,
+        "bandwidth_gbps": bandwidth,
+        "p2p_enabled": enabled,
+        "min_gbps": min(measured) if measured else None,
+        "max_gbps": max(measured) if measured else None,
+        "mean_gbps": (sum(measured) / len(measured)) if measured else None,
+    }
+    return card
+
+
+def _build_peak_performance_cards(gpu_key: str, gfx_version: Optional[str], compute_units: int,
+                                  clock_mhz: float, max_memory: Optional[float]) -> List[Dict]:
+    """Build the display cards (and raw numerics) for a GPU's theoretical peak performance."""
+    peaks = compute_peak_performance(gfx_version, compute_units, clock_mhz)
+    cards: List[Dict] = []
+
+    # Units differ: integer formats are counted in TOPS, floating point in TFLOPS.
+    def fmt(precision: str, value: float) -> str:
+        return f"{value:.1f} {'TOPS' if precision.startswith('INT') else 'TFLOPS'}"
+
+    dense_info = OrderedDict()
+    dense_info["Section"] = f"{gpu_key} - Dense Peak Performance"
+    dense_info["Compute Units"] = str(compute_units)
+    dense_info["Max Clock Frequency"] = f"{clock_mhz:.0f} MHz"
+
+    if peaks["arch"]:
+        dense_info["Architecture"] = peaks["arch"]
+    else:
+        # Unknown architecture: report the fact rather than guessing at multipliers.
+        dense_info["Architecture"] = f"Unknown ({gfx_version or 'gfx version not detected'})"
+        dense_info["Note"] = "Peak performance not calculated - architecture not in rate table"
+        if max_memory:
+            dense_info["Max Memory"] = f"{max_memory:.2f} GB"
+        return [dense_info]
+
+    for precision, value in peaks["vector"].items():
+        dense_info[f"{precision} (vector)"] = fmt(precision, value)
+    for precision, value in peaks["matrix"].items():
+        dense_info[f"{precision} (matrix)"] = fmt(precision, value)
+
+    if max_memory:
+        dense_info["Max Memory"] = f"{max_memory:.2f} GB"
+
+    # Machine-readable numerics alongside the formatted strings, for charting and thresholds.
+    dense_info["_raw"] = {
+        "gfx_version": gfx_version,
+        "architecture": peaks["arch"],
+        "compute_units": compute_units,
+        "clock_mhz": clock_mhz,
+        "memory_gb": round(max_memory, 2) if max_memory else None,
+        "peak_vector_tflops": {p: round(v, 1) for p, v in peaks["vector"].items()},
+        "peak_matrix_tflops": {p: round(v, 1) for p, v in peaks["matrix"].items()},
+    }
+    cards.append(dense_info)
+
+    if peaks["sparse"]:
+        sparse_info = OrderedDict()
+        sparse_info["Section"] = f"{gpu_key} - Sparse Peak Performance"
+        sparse_info["Compute Units"] = str(compute_units)
+        sparse_info["Max Clock Frequency"] = f"{clock_mhz:.0f} MHz"
+        sparse_info["Architecture"] = peaks["arch"]
+        sparse_info["Note"] = "2:4 structured sparsity (2x dense matrix rate)"
+        for precision, value in peaks["sparse"].items():
+            sparse_info[f"{precision} (matrix, sparse)"] = fmt(precision, value)
+        sparse_info["_raw"] = {
+            "gfx_version": gfx_version,
+            "architecture": peaks["arch"],
+            "peak_sparse_tflops": {p: round(v, 1) for p, v in peaks["sparse"].items()},
+        }
+        cards.append(sparse_info)
+
+    return cards
+
+
 def gather_gpu_microbenchmarks(include_p2p: bool = False, verbose: bool = True) -> Dict[str, List[Dict[str, str]]]:
     """Gather GPU microbenchmark information including peak performance and optionally GPU-to-GPU communication."""
     details: Dict[str, List[Dict[str, str]]] = OrderedDict()
@@ -1553,105 +1834,13 @@ def gather_gpu_microbenchmarks(include_p2p: bool = False, verbose: bool = True) 
                     if gfx_version:
                         gpu_key += f" ({gfx_version})"
 
-                    # Calculate maximum theoretical performance
-                    # Standard assumption: 128 FP32 ops per CU per clock (64 SPs * 2 ops/clock FMA)
-                    ops_per_cu_per_clock = 128
-
                     # Use detected or estimated clock frequency
                     base_clock = max_clock_freq if max_clock_freq else 1500  # Default 1.5 GHz if not detected
 
-                    # Calculate FP32 peak performance (dense)
-                    fp32_dense_tflops = (compute_units * ops_per_cu_per_clock * base_clock) / 1e6
-                    
-                    # Sparse performance is typically 2x dense for certain architectures
-                    fp32_sparse_tflops = fp32_dense_tflops * 2 if gfx_version and any(arch in gfx_version.lower() for arch in ["gfx90a", "gfx940", "gfx941", "gfx942"]) else fp32_dense_tflops
-
-                    # Create separate cards for Dense and Sparse calculations
-                    
-                    # DENSE CALCULATIONS
-                    dense_info = OrderedDict()
-                    dense_info["Section"] = f"{gpu_key} - Dense Peak Performance"
-                    dense_info["Compute Units"] = str(compute_units)
-                    dense_info["Max Clock Frequency"] = f"{base_clock:.0f} MHz"
-                    
-                    # FP64 (double precision)
-                    if gfx_version and any(arch in gfx_version.lower() for arch in ["gfx90a", "gfx940", "gfx941", "gfx942"]):
-                        fp64_dense = fp32_dense_tflops
-                        dense_info["FP64 (double precision)"] = f"{fp64_dense:.1f} TFLOPS"
-                    elif gfx_version and any(arch in gfx_version.lower() for arch in ["gfx900", "gfx906", "gfx908"]):
-                        fp64_dense = fp32_dense_tflops / 2
-                        dense_info["FP64 (double precision)"] = f"{fp64_dense:.1f} TFLOPS"
-                    else:
-                        fp64_dense = fp32_dense_tflops / 16
-                        dense_info["FP64 (double precision)"] = f"{fp64_dense:.1f} TFLOPS"
-                    
-                    # FP32 (single precision)
-                    dense_info["FP32 (single precision)"] = f"{fp32_dense_tflops:.1f} TFLOPS (matrix and vector)"
-                    
-                    # TF32 (TensorFloat-32) - 4x FP32 for CDNA2+
-                    tf32_dense = fp32_dense_tflops * 4
-                    if gfx_version and any(arch in gfx_version.lower() for arch in ["gfx90a", "gfx940", "gfx941", "gfx942"]):
-                        dense_info["TF32 (TensorFloat-32)"] = f"{tf32_dense:.1f} TFLOPS"
-                    
-                    # FP16 / BF16
-                    fp16_dense = fp32_dense_tflops * 2
-                    if gfx_version and any(arch in gfx_version.lower() for arch in ["gfx90a", "gfx940", "gfx941", "gfx942", "gfx1100", "gfx1101"]):
-                        dense_info["FP16 / BF16"] = f"{fp16_dense:.1f} TFLOPS"
-                    else:
-                        dense_info["FP16"] = f"{fp16_dense:.1f} TFLOPS"
-                    
-                    # FP8
-                    fp8_dense = fp32_dense_tflops * 8
-                    if gfx_version and any(arch in gfx_version.lower() for arch in ["gfx940", "gfx941", "gfx942"]):
-                        dense_info["FP8"] = f"{fp8_dense:.1f} TFLOPS"
-                    
-                    # INT8
-                    int8_dense = fp32_dense_tflops * 4
-                    if gfx_version and any(arch in gfx_version.lower() for arch in ["gfx90a", "gfx940", "gfx941", "gfx942"]):
-                        dense_info["INT8"] = f"{int8_dense:.1f} TOPS"
-                    
-                    if max_memory:
-                        dense_info["Max Memory"] = f"{max_memory:.2f} GB"
-                    
-                    microbenchmark_list.append(dense_info)
-                    
-                    # SPARSE CALCULATIONS (only for supported architectures)
-                    if gfx_version and any(arch in gfx_version.lower() for arch in ["gfx90a", "gfx940", "gfx941", "gfx942"]):
-                        sparse_info = OrderedDict()
-                        sparse_info["Section"] = f"{gpu_key} - Sparse Peak Performance"
-                        sparse_info["Compute Units"] = str(compute_units)
-                        sparse_info["Max Clock Frequency"] = f"{base_clock:.0f} MHz"
-                        sparse_info["Note"] = "2:1 sparse matrix operations (50% sparsity)"
-                        
-                        # FP64 sparse
-                        fp64_sparse = fp64_dense * 2
-                        sparse_info["FP64 (double precision)"] = f"{fp64_sparse:.1f} TFLOPS"
-                        
-                        # FP32 sparse
-                        sparse_info["FP32 (single precision)"] = f"{fp32_sparse_tflops:.1f} TFLOPS (matrix and vector)"
-                        
-                        # TF32 sparse
-                        tf32_sparse = tf32_dense * 2
-                        sparse_info["TF32 (TensorFloat-32)"] = f"{tf32_sparse:.1f} TFLOPS"
-                        
-                        # FP16 / BF16 sparse
-                        fp16_sparse = fp16_dense * 2
-                        sparse_info["FP16 / BF16"] = f"{fp16_sparse:.1f} TFLOPS"
-                        
-                        # FP8 sparse
-                        if gfx_version and any(arch in gfx_version.lower() for arch in ["gfx940", "gfx941", "gfx942"]):
-                            fp8_sparse = fp8_dense * 2
-                            # FP8 range for sparse
-                            fp8_min = fp8_dense
-                            fp8_max = fp8_sparse
-                            sparse_info["FP8"] = f"{fp8_min:.1f}–{fp8_max:.1f} TFLOPS"
-                        
-                        # INT8 sparse
-                        int8_sparse = int8_dense * 2
-                        sparse_info["INT8"] = f"{int8_sparse:.1f} TOPS"
-                        
-                        microbenchmark_list.append(sparse_info)
-
+                    microbenchmark_list.extend(
+                        _build_peak_performance_cards(gpu_key, gfx_version, compute_units,
+                                                      base_clock, max_memory)
+                    )
                 # Reset for next GPU
                 current_gpu = None
                 gfx_version = None
@@ -1697,98 +1886,12 @@ def gather_gpu_microbenchmarks(include_p2p: bool = False, verbose: bool = True) 
             if gfx_version:
                 gpu_key += f" ({gfx_version})"
 
-            ops_per_cu_per_clock = 128
             base_clock = max_clock_freq if max_clock_freq else 1500
 
-            # Calculate FP32 peak performance (dense)
-            fp32_dense_tflops = (compute_units * ops_per_cu_per_clock * base_clock) / 1e6
-            
-            # Sparse performance is typically 2x dense for certain architectures
-            fp32_sparse_tflops = fp32_dense_tflops * 2 if gfx_version and any(arch in gfx_version.lower() for arch in ["gfx90a", "gfx940", "gfx941", "gfx942"]) else fp32_dense_tflops
-
-            # DENSE CALCULATIONS
-            dense_info = OrderedDict()
-            dense_info["Section"] = f"{gpu_key} - Dense Peak Performance"
-            dense_info["Compute Units"] = str(compute_units)
-            dense_info["Max Clock Frequency"] = f"{base_clock:.0f} MHz"
-            
-            # FP64 (double precision)
-            if gfx_version and any(arch in gfx_version.lower() for arch in ["gfx90a", "gfx940", "gfx941", "gfx942"]):
-                fp64_dense = fp32_dense_tflops
-                dense_info["FP64 (double precision)"] = f"{fp64_dense:.1f} TFLOPS"
-            elif gfx_version and any(arch in gfx_version.lower() for arch in ["gfx900", "gfx906", "gfx908"]):
-                fp64_dense = fp32_dense_tflops / 2
-                dense_info["FP64 (double precision)"] = f"{fp64_dense:.1f} TFLOPS"
-            else:
-                fp64_dense = fp32_dense_tflops / 16
-                dense_info["FP64 (double precision)"] = f"{fp64_dense:.1f} TFLOPS"
-            
-            # FP32 (single precision)
-            dense_info["FP32 (single precision)"] = f"{fp32_dense_tflops:.1f} TFLOPS (matrix and vector)"
-            
-            # TF32 (TensorFloat-32) - 4x FP32 for CDNA2+
-            tf32_dense = fp32_dense_tflops * 4
-            if gfx_version and any(arch in gfx_version.lower() for arch in ["gfx90a", "gfx940", "gfx941", "gfx942"]):
-                dense_info["TF32 (TensorFloat-32)"] = f"{tf32_dense:.1f} TFLOPS"
-            
-            # FP16 / BF16
-            fp16_dense = fp32_dense_tflops * 2
-            if gfx_version and any(arch in gfx_version.lower() for arch in ["gfx90a", "gfx940", "gfx941", "gfx942", "gfx1100", "gfx1101"]):
-                dense_info["FP16 / BF16"] = f"{fp16_dense:.1f} TFLOPS"
-            else:
-                dense_info["FP16"] = f"{fp16_dense:.1f} TFLOPS"
-            
-            # FP8
-            fp8_dense = fp32_dense_tflops * 8
-            if gfx_version and any(arch in gfx_version.lower() for arch in ["gfx940", "gfx941", "gfx942"]):
-                dense_info["FP8"] = f"{fp8_dense:.1f} TFLOPS"
-            
-            # INT8
-            int8_dense = fp32_dense_tflops * 4
-            if gfx_version and any(arch in gfx_version.lower() for arch in ["gfx90a", "gfx940", "gfx941", "gfx942"]):
-                dense_info["INT8"] = f"{int8_dense:.1f} TOPS"
-            
-            if max_memory:
-                dense_info["Max Memory"] = f"{max_memory:.2f} GB"
-            
-            microbenchmark_list.append(dense_info)
-            
-            # SPARSE CALCULATIONS (only for supported architectures)
-            if gfx_version and any(arch in gfx_version.lower() for arch in ["gfx90a", "gfx940", "gfx941", "gfx942"]):
-                sparse_info = OrderedDict()
-                sparse_info["Section"] = f"{gpu_key} - Sparse Peak Performance"
-                sparse_info["Compute Units"] = str(compute_units)
-                sparse_info["Max Clock Frequency"] = f"{base_clock:.0f} MHz"
-                sparse_info["Note"] = "2:1 sparse matrix operations (50% sparsity)"
-                
-                # FP64 sparse
-                fp64_sparse = fp64_dense * 2
-                sparse_info["FP64 (double precision)"] = f"{fp64_sparse:.1f} TFLOPS"
-                
-                # FP32 sparse
-                sparse_info["FP32 (single precision)"] = f"{fp32_sparse_tflops:.1f} TFLOPS (matrix and vector)"
-                
-                # TF32 sparse
-                tf32_sparse = tf32_dense * 2
-                sparse_info["TF32 (TensorFloat-32)"] = f"{tf32_sparse:.1f} TFLOPS"
-                
-                # FP16 / BF16 sparse
-                fp16_sparse = fp16_dense * 2
-                sparse_info["FP16 / BF16"] = f"{fp16_sparse:.1f} TFLOPS"
-                
-                # FP8 sparse
-                if gfx_version and any(arch in gfx_version.lower() for arch in ["gfx940", "gfx941", "gfx942"]):
-                    fp8_sparse = fp8_dense * 2
-                    # FP8 range for sparse
-                    fp8_min = fp8_dense
-                    fp8_max = fp8_sparse
-                    sparse_info["FP8"] = f"{fp8_min:.1f}–{fp8_max:.1f} TFLOPS"
-                
-                # INT8 sparse
-                int8_sparse = int8_dense * 2
-                sparse_info["INT8"] = f"{int8_sparse:.1f} TOPS"
-                
-                microbenchmark_list.append(sparse_info)
+            microbenchmark_list.extend(
+                _build_peak_performance_cards(gpu_key, gfx_version, compute_units,
+                                              base_clock, max_memory)
+            )
 
     # Add kernel benchmarks (GEMM, memory bandwidth, vector ops, convolution)
     script_dir = os.path.dirname(os.path.abspath(__file__))
@@ -1798,12 +1901,12 @@ def gather_gpu_microbenchmarks(include_p2p: bool = False, verbose: bool = True) 
     if os.path.exists(kernel_cpp_file):
         if verbose:
             print(f"Compiling GPU kernel benchmarks: {kernel_cpp_file}")
-        compile_result = run_command(["hipcc", "-O3", "-o", kernel_exe_file, kernel_cpp_file])
+        compile_result = run_command(["hipcc", "-O3", "-o", kernel_exe_file, kernel_cpp_file], timeout=COMPILE_TIMEOUT)
         
         if compile_result is not None or os.path.exists(kernel_exe_file):
             if verbose:
                 print(f"Running GPU kernel benchmarks: {kernel_exe_file}")
-            kernel_output = run_command([kernel_exe_file])
+            kernel_output = run_command([kernel_exe_file], timeout=BENCHMARK_TIMEOUT)
             
             if kernel_output:
                 try:
@@ -1853,7 +1956,20 @@ def gather_gpu_microbenchmarks(include_p2p: bool = False, verbose: bool = True) 
                                     conv = result["convolution_test"]
                                     benchmark_info["1D Convolution"] = f"{conv.get('gflops', 0):.2f} GFLOPS"
                                     benchmark_info["Conv Kernel Size"] = f"{conv.get('kernel_size', 0)}"
-                                
+
+                                # Machine-readable numerics for charting and outlier detection.
+                                # The display values above are formatted strings; these are not.
+                                benchmark_info["_raw"] = {
+                                    "gpu_id": gpu_id,
+                                    "gpu_name": gpu_name,
+                                    "memory_bandwidth_gbps": result.get("memory_bandwidth_test", {}).get("bandwidth_gbps"),
+                                    "gemm_fp32_gflops": result.get("gemm_fp32_test", {}).get("gflops"),
+                                    "gemm_fp64_gflops": result.get("gemm_fp64_test", {}).get("gflops"),
+                                    "vector_add_gflops": result.get("vector_add_test", {}).get("gflops"),
+                                    "fma_tflops": result.get("fma_throughput_test", {}).get("tflops"),
+                                    "convolution_gflops": result.get("convolution_test", {}).get("gflops"),
+                                }
+
                                 microbenchmark_list.append(benchmark_info)
                 except json.JSONDecodeError as e:
                     error_info = OrderedDict()
@@ -1877,7 +1993,7 @@ def gather_gpu_microbenchmarks(include_p2p: bool = False, verbose: bool = True) 
             # Try to compile the benchmark
             if verbose:
                 print(f"Compiling GPU P2P benchmark: {cpp_file}")
-            compile_result = run_command(["hipcc", "-o", exe_file, cpp_file])
+            compile_result = run_command(["hipcc", "-o", exe_file, cpp_file], timeout=COMPILE_TIMEOUT)
 
             if compile_result is None and not os.path.exists(exe_file):
                 error_info = OrderedDict()
@@ -1888,7 +2004,7 @@ def gather_gpu_microbenchmarks(include_p2p: bool = False, verbose: bool = True) 
                 # Run the compiled benchmark
                 if verbose:
                     print(f"Running GPU P2P benchmark: {exe_file}")
-                p2p_output = run_command([exe_file])
+                p2p_output = run_command([exe_file], timeout=BENCHMARK_TIMEOUT)
 
                 if not p2p_output:
                     error_info = OrderedDict()
@@ -1909,7 +2025,9 @@ def gather_gpu_microbenchmarks(include_p2p: bool = False, verbose: bool = True) 
                                 error_info["Status"] = data["error"]
                                 microbenchmark_list.append(error_info)
                             elif "results" in data:
-                                # Add each P2P result as a card
+                                # Collect pairs as we go so we can also emit one N x N
+                                # matrix card, which is what the report heatmap consumes.
+                                p2p_pairs = []
                                 for result in data["results"]:
                                     p2p_info = OrderedDict()
                                     src_gpu = result.get("src_gpu", "?")
@@ -1927,7 +2045,19 @@ def gather_gpu_microbenchmarks(include_p2p: bool = False, verbose: bool = True) 
                                     else:
                                         p2p_info["Bandwidth"] = "Not Available"
 
+                                    p2p_info["_raw"] = {
+                                        "src_gpu": src_gpu,
+                                        "dst_gpu": dst_gpu,
+                                        "p2p_enabled": bool(result.get("p2p_enabled", False)),
+                                        "bandwidth_gbps": bandwidth if bandwidth > 0 else None,
+                                    }
+                                    p2p_pairs.append(p2p_info["_raw"])
+
                                     microbenchmark_list.append(p2p_info)
+
+                                matrix_card = _build_p2p_matrix_card(p2p_pairs)
+                                if matrix_card:
+                                    microbenchmark_list.append(matrix_card)
                             else:
                                 error_info = OrderedDict()
                                 error_info["Section"] = "GPU P2P Communication - Error"
@@ -1947,12 +2077,12 @@ def gather_gpu_microbenchmarks(include_p2p: bool = False, verbose: bool = True) 
         if os.path.exists(host_cpp_file):
             if verbose:
                 print(f"Compiling GPU-CPU bandwidth benchmark: {host_cpp_file}")
-            compile_result = run_command(["hipcc", "-o", host_exe_file, host_cpp_file])
+            compile_result = run_command(["hipcc", "-o", host_exe_file, host_cpp_file], timeout=COMPILE_TIMEOUT)
 
             if compile_result is not None or os.path.exists(host_exe_file):
                 if verbose:
                     print(f"Running GPU-CPU bandwidth benchmark: {host_exe_file}")
-                host_output = run_command([host_exe_file])
+                host_output = run_command([host_exe_file], timeout=BENCHMARK_TIMEOUT)
 
                 if host_output:
                     try:
@@ -1979,6 +2109,15 @@ def gather_gpu_microbenchmarks(include_p2p: bool = False, verbose: bool = True) 
                                     host_bw_info["Host→Device (Pinned)"] = f"{result.get('h2d_pinned_gbps', 0):.2f} GB/s"
                                     host_bw_info["Device→Host (Pinned)"] = f"{result.get('d2h_pinned_gbps', 0):.2f} GB/s"
 
+                                    host_bw_info["_raw"] = {
+                                        "gpu_id": gpu_id,
+                                        "gpu_name": gpu_name,
+                                        "h2d_pageable_gbps": result.get("h2d_pageable_gbps"),
+                                        "d2h_pageable_gbps": result.get("d2h_pageable_gbps"),
+                                        "h2d_pinned_gbps": result.get("h2d_pinned_gbps"),
+                                        "d2h_pinned_gbps": result.get("d2h_pinned_gbps"),
+                                    }
+
                                     microbenchmark_list.append(host_bw_info)
                     except json.JSONDecodeError as e:
                         error_info = OrderedDict()
@@ -1993,12 +2132,12 @@ def gather_gpu_microbenchmarks(include_p2p: bool = False, verbose: bool = True) 
         if os.path.exists(topology_cpp_file):
             if verbose:
                 print(f"Compiling GPU topology analysis: {topology_cpp_file}")
-            compile_result = run_command(["hipcc", "-o", topology_exe_file, topology_cpp_file])
+            compile_result = run_command(["hipcc", "-o", topology_exe_file, topology_cpp_file], timeout=COMPILE_TIMEOUT)
 
             if compile_result is not None or os.path.exists(topology_exe_file):
                 if verbose:
                     print(f"Running GPU topology analysis: {topology_exe_file}")
-                topology_output = run_command([topology_exe_file])
+                topology_output = run_command([topology_exe_file], timeout=BENCHMARK_TIMEOUT)
 
                 if topology_output:
                     try:
@@ -2037,7 +2176,28 @@ def gather_gpu_microbenchmarks(include_p2p: bool = False, verbose: bool = True) 
                                 topo_summary["PCIe Links"] = str(pcie_links)
                                 if no_p2p_links > 0:
                                     topo_summary["No P2P Links"] = str(no_p2p_links)
-                                
+
+                                # Full link matrix in numeric form, for the report heatmap
+                                # and for link-type uniformity checks.
+                                topo_summary["_raw"] = {
+                                    "gpu_count": data.get("gpu_count", 0),
+                                    "xgmi_links": xgmi_links,
+                                    "pcie_links": pcie_links,
+                                    "no_p2p_links": no_p2p_links,
+                                    "link_matrix": [
+                                        [
+                                            {
+                                                "dst": link.get("dst"),
+                                                "link_type": link.get("link_type"),
+                                                "hops": link.get("hops"),
+                                                "bandwidth_gbps": link.get("bandwidth_gbps"),
+                                            }
+                                            for link in row
+                                        ]
+                                        for row in data["bandwidth_matrix"]
+                                    ],
+                                }
+
                                 microbenchmark_list.append(topo_summary)
                                 
                                 # Add detailed bandwidth matrix for each GPU
@@ -2082,7 +2242,7 @@ def gather_gpu_microbenchmarks(include_p2p: bool = False, verbose: bool = True) 
         if os.path.exists(storage_py_file):
             if verbose:
                 print(f"Running storage I/O profiling: {storage_py_file}")
-            storage_output = run_command(["python3", storage_py_file])
+            storage_output = run_command(["python3", storage_py_file], timeout=BENCHMARK_TIMEOUT)
             
             if storage_output:
                 try:
@@ -2184,7 +2344,7 @@ def gather_gpu_microbenchmarks(include_p2p: bool = False, verbose: bool = True) 
         if os.path.exists(network_py_file):
             if verbose:
                 print(f"Running network performance testing: {network_py_file}")
-            network_output = run_command(["python3", network_py_file])
+            network_output = run_command(["python3", network_py_file], timeout=BENCHMARK_TIMEOUT)
             
             if network_output:
                 try:
@@ -2602,6 +2762,23 @@ def _parse_args() -> argparse.Namespace:
         action="store_true",
         help="Enable verbose output (show tool availability check and progress messages)",
     )
+    parser.add_argument(
+        "-o",
+        "--output",
+        metavar="FILE",
+        help="Write the JSON to this exact path (overrides the default serverinfo_<hostname>.json)",
+    )
+    parser.add_argument(
+        "--output-dir",
+        metavar="DIR",
+        help="Directory to write the JSON into (created if it does not exist)",
+    )
+    parser.add_argument(
+        "--tag",
+        metavar="TAG",
+        help="Suffix for the output filename, e.g. --tag before -> serverinfo_<hostname>_before.json. "
+             "Useful for collecting the same host twice without overwriting.",
+    )
     return parser.parse_args()
 
 def main() -> None:
@@ -2705,7 +2882,13 @@ def main() -> None:
         "collection_date": datetime.datetime.now().isoformat(),
         "collection_status": "partial" if collection_errors else "complete",
         "errors": collection_errors if collection_errors else [],
-        "command_line": ' '.join(sys.argv)
+        "command_line": ' '.join(sys.argv),
+        # A misconfigured resolver can make gethostname() raise; losing the whole
+        # collected payload over the machine's name would be absurd.
+        "hostname": _safe_hostname(),
+        # Commands that timed out or errored, so a blank section can be explained
+        # rather than being mistaken for "this machine has none of that hardware".
+        "command_failures": COMMAND_FAILURES,
     }
     
     payload["cpu"] = cpu_details
@@ -2728,14 +2911,35 @@ def main() -> None:
     if microbenchmark_details:
         payload["microbenchmarks"] = microbenchmark_details
 
-    # Generate filename with system name
-    try:
-        hostname = socket.gethostname()
+    # Determine the output path: an explicit --output wins, otherwise build
+    # serverinfo_<hostname>[_<tag>].json inside --output-dir (default: current directory).
+    if args.output:
+        # --output names the file outright, so the pieces the name would have been
+        # built from no longer apply. Say so rather than ignoring them silently.
+        ignored = [flag for flag, value in (("--tag", args.tag), ("--output-dir", args.output_dir)) if value]
+        if ignored:
+            print(f"Note: {' and '.join(ignored)} ignored because --output specifies the full path")
+        filename = args.output
+    else:
+        hostname = _safe_hostname()
         # Sanitize hostname for filename (replace invalid characters)
         safe_hostname = "".join(c if c.isalnum() or c in ("-", "_") else "_" for c in hostname)
-        filename = f"serverinfo_{safe_hostname}.json"
-    except Exception:
-        filename = "serverinfo.json"
+        basename = f"serverinfo_{safe_hostname}" if safe_hostname else "serverinfo"
+
+        if args.tag:
+            safe_tag = "".join(c if c.isalnum() or c in ("-", "_") else "_" for c in args.tag)
+            basename = f"{basename}_{safe_tag}"
+
+        filename = os.path.join(args.output_dir, f"{basename}.json") if args.output_dir else f"{basename}.json"
+
+    # Create the target directory if the user pointed somewhere that does not exist yet
+    out_dir = os.path.dirname(os.path.abspath(filename))
+    if out_dir and not os.path.isdir(out_dir):
+        try:
+            os.makedirs(out_dir, exist_ok=True)
+        except OSError as e:
+            print(f"\nERROR: Could not create output directory {out_dir}: {e}")
+            raise SystemExit(1)
 
     # Write JSON with error handling to ensure file is always complete
     try:
@@ -2759,6 +2963,21 @@ def main() -> None:
             for error in collection_errors:
                 print(f"  - {error}")
             print(f"\nPartial data has been saved. Re-run collection to get complete data.")
+
+        # Timeouts always deserve a mention: they usually mean wedged hardware, and the
+        # resulting empty section looks identical to "this machine has no such device".
+        timed_out = [c for c, f in COMMAND_FAILURES.items() if f["reason"] == "timeout"]
+        if timed_out:
+            print(f"\nWarning: {len(timed_out)} command(s) timed out and were skipped:")
+            for cmd in timed_out:
+                print(f"  - {cmd} ({COMMAND_FAILURES[cmd]['detail']})")
+
+        if args.verbose:
+            errored = [c for c, f in COMMAND_FAILURES.items() if f["reason"] == "error"]
+            if errored:
+                print(f"\n{len(errored)} command(s) returned an error:")
+                for cmd in errored:
+                    print(f"  - {cmd}: {COMMAND_FAILURES[cmd]['detail']}")
     
     except Exception as e:
         print(f"\nERROR: Failed to write JSON file: {filename}")
