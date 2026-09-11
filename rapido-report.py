@@ -207,6 +207,21 @@ def _render_p2p_heatmap(raw: Dict[str, Any]) -> str:
     measured = [v for row in matrix for v in row if _is_num(v)]
     if not measured:
         return ""
+
+    # Per-hop interconnect type, when the collector managed to read it. The
+    # interesting case is the minority one: a single PCIe hop in an otherwise
+    # all-XGMI mesh explains a slow link far better than the bandwidth alone.
+    links = raw.get("link_types") or []
+
+    def link_of(i: int, j: int) -> str:
+        if i < len(links) and isinstance(links[i], list) and j < len(links[i]):
+            value = links[i][j]
+            if isinstance(value, str) and value:
+                return value
+        return ""
+
+    seen_links = [link_of(i, j) for i in range(n) for j in range(n) if i != j and link_of(i, j)]
+    dominant = max(set(seen_links), key=seen_links.count) if seen_links else ""
     # Scale from zero rather than from the observed minimum. Min-max scaling
     # would stretch a couple of percent of run-to-run noise across the whole
     # gradient, making a healthy uniform node look alarmingly varied.
@@ -248,11 +263,22 @@ def _render_p2p_heatmap(raw: Dict[str, Any]) -> str:
             else:
                 fill, text, title = "#f8d7da", "n/a", f"GPU {ids[i]} → GPU {ids[j]}: not measured"
                 ink = "#842029"
+
+            link = link_of(i, j) if i != j else ""
+            if link:
+                title += f" over {link}"
+            # Only the odd hop out gets a printed tag; tagging all 56 cells of a
+            # uniform mesh would be noise. The dominant type is named in the caption.
+            tag = ""
+            if link and dominant and link != dominant:
+                tag = (f"<text x='{x + (cell - 2) / 2:.1f}' y='{y + cell - 8:.1f}' "
+                       f"class='cell link' fill='{ink}' text-anchor='middle'>{escape(link)}</text>")
+
             parts.append(
                 f"<g><title>{escape(title)}</title>"
                 f"<rect x='{x}' y='{y}' width='{cell - 2}' height='{cell - 2}' rx='3' fill='{fill}'/>"
                 f"<text x='{x + (cell - 2) / 2:.1f}' y='{y + cell / 2 + 4:.1f}' class='cell' "
-                f"fill='{ink}' text-anchor='middle'>{escape(text)}</text></g>"
+                f"fill='{ink}' text-anchor='middle'>{escape(text)}</text>{tag}</g>"
             )
 
     # Gradient legend. Sized to the grid so it cannot run past the viewBox on a
@@ -349,6 +375,47 @@ _HOST_BAR_METRICS = [
 
 _NO_DASH = "<p class='no-data'>No chartable benchmark data</p>"
 
+# How the collector's failure reasons read to someone looking at the report.
+_FAILURE_REASONS = {
+    "not_found": "not installed",
+    "timeout": "timed out",
+    "error": "returned an error",
+}
+
+
+def _render_command_failures(sources: List[Any]) -> str:
+    """Banner listing the commands that failed during collection, and why.
+
+    rapido-collect.py records every failure with a reason, but a reader looking at a
+    gap in the report otherwise cannot tell whether the tool was missing, hung, or
+    errored. `sources` is a list of (label, data) pairs; the label is only printed in
+    comparison mode, where a failure may apply to just one of the two files.
+    """
+    blocks: List[str] = []
+    for label, data in sources:
+        if not isinstance(data, dict):
+            continue
+        failures = data.get("command_failures")
+        if not isinstance(failures, dict) or not failures:
+            continue
+        rows = []
+        for command, info in failures.items():
+            info = info if isinstance(info, dict) else {}
+            reason = _FAILURE_REASONS.get(info.get("reason"), info.get("reason") or "failed")
+            detail = info.get("detail") or ""
+            rows.append(
+                f"<li><code>{escape(str(command))}</code> — {escape(reason)}"
+                + (f" <span class='detail'>({escape(str(detail))})</span>" if detail else "")
+                + "</li>"
+            )
+        heading = f"Collection warnings ({escape(label)})" if label else "Collection warnings"
+        blocks.append(
+            f"<div class='failures'><strong>{heading}</strong>"
+            f"<p class='caption'>These commands did not complete, so the sections that "
+            f"depend on them may be missing or incomplete.</p><ul>{''.join(rows)}</ul></div>"
+        )
+    return "".join(blocks)
+
 
 def _render_microbench_dashboard(items: List[Any]) -> str:
     """Build the charts panel that heads the Microbenchmarks tab.
@@ -366,6 +433,29 @@ def _render_microbench_dashboard(items: List[Any]) -> str:
             mean = p2p[0].get("mean_gbps")
             low = p2p[0].get("min_gbps")
             caption = "Peer-to-peer bandwidth, source GPU (rows) to destination GPU (columns)."
+            # Name the interconnect, and call out any hop that is not on it: on an
+            # Instinct node a stray PCIe link where XGMI is expected is a real defect.
+            link_rows = p2p[0].get("link_types") or []
+            kinds: Dict[str, int] = {}
+            for i, row in enumerate(link_rows):
+                if not isinstance(row, list):
+                    continue
+                for j, kind in enumerate(row):
+                    if i != j and isinstance(kind, str) and kind:
+                        kinds[kind] = kinds.get(kind, 0) + 1
+            if kinds:
+                if len(kinds) == 1:
+                    only = next(iter(kinds))
+                    caption += f" All {kinds[only]} links are {escape(only)}."
+                else:
+                    main = max(kinds, key=lambda k: kinds[k])
+                    others = ", ".join(f"{count}x {escape(k)}"
+                                       for k, count in sorted(kinds.items()) if k != main)
+                    caption += (f" Mostly {escape(main)} ({kinds[main]} links); "
+                                f"labelled cells differ: {others}.")
+                    warnings.append(
+                        f"Mixed GPU interconnect: {others} alongside {kinds[main]}x {main}"
+                    )
             if mean and low and (mean - low) / mean > OUTLIER_THRESHOLD:
                 warnings.append(
                     f"Slowest P2P link {low:.2f} GB/s is {((low - mean) / mean) * 100:+.1f}% "
@@ -535,6 +625,14 @@ def generate_comparison_html(file1_path: Optional[Path], file2_path: Optional[Pa
         command_line1 = data1["_metadata"].get("command_line", "")
     if data2 and "_metadata" in data2:
         command_line2 = data2["_metadata"].get("command_line", "")
+
+    # Collection problems, surfaced at the top of the report. The collector records
+    # why each command failed precisely so the reader can tell a missing tool apart
+    # from a hung or erroring one instead of just seeing an absent section.
+    failures_banner = _render_command_failures(
+        [(file1_name, data1), (file2_name, data2)] if is_comparison else
+        [("", data1 or data2)]
+    )
 
     # Check which sections have data in either file
     has_cpu = False
@@ -1006,6 +1104,15 @@ def generate_comparison_html(file1_path: Optional[Path], file2_path: Optional[Pa
             color: #f3c99a;
         }}
 
+        body.dark .failures {{
+            background: #3a1e1c;
+            color: #f4b6b0;
+        }}
+
+        body.dark .failures code {{
+            background: rgba(255, 255, 255, 0.1);
+        }}
+
         /* ---- Microbenchmark dashboard ---- */
         .dashboard {{
             background: white;
@@ -1072,6 +1179,13 @@ def generate_comparison_html(file1_path: Optional[Path], file2_path: Optional[Pa
             font-weight: 600;
         }}
 
+        /* Interconnect tag under the number, only drawn on the odd hop out. */
+        .chart text.cell.link {{
+            font-size: 8px;
+            font-weight: 700;
+            letter-spacing: 0.03em;
+        }}
+
         .chart line.med {{
             stroke: #495057;
         }}
@@ -1087,6 +1201,35 @@ def generate_comparison_html(file1_path: Optional[Path], file2_path: Optional[Pa
 
         .uniformity-warn ul {{
             margin: 8px 0 0 0;
+        }}
+
+        .failures {{
+            background: #fdecea;
+            border-left: 4px solid #c62828;
+            border-radius: 4px;
+            margin-bottom: 16px;
+            padding: 12px 16px;
+            color: #5f1a16;
+            font-size: 0.9rem;
+        }}
+
+        .failures ul {{
+            margin: 8px 0 0 18px;
+        }}
+
+        .failures li {{
+            margin-bottom: 3px;
+        }}
+
+        .failures code {{
+            background: rgba(0, 0, 0, 0.06);
+            border-radius: 3px;
+            padding: 1px 5px;
+            font-size: 0.85rem;
+        }}
+
+        .failures .detail {{
+            opacity: 0.8;
         }}
 
         .no-data {{
@@ -1134,6 +1277,8 @@ def generate_comparison_html(file1_path: Optional[Path], file2_path: Optional[Pa
                 {f'<div style="margin-bottom: 10px; margin-top: 15px;"><strong>File 2 Collection:</strong></div><div class="command-box">{escape(command_line2)}</div>' if command_line2 and is_comparison else ''}
             </div>''' if (command_line1 or command_line2) else ''}
         </div>
+
+        {failures_banner}
 
         <div class="tabs" id="tabs-container">
             {f'<button class="tab{" active" if first_tab == "cpu" else ""}" onclick="openTab(event, ' + "'cpu'" + ')" draggable="true" data-tab="cpu">CPU</button>' if has_cpu else ''}
