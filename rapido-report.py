@@ -943,14 +943,20 @@ def generate_comparison_html(file1_path: Optional[Path], file2_path: Optional[Pa
             background: white;
             border-radius: 8px;
             box-shadow: 0 2px 4px rgba(0,0,0,0.1);
-            overflow: hidden;
         }}
 
+        /* No "overflow: hidden" on .container: that property turns it into the
+           containing block for "position: sticky" descendants, and since the
+           container's height is intrinsic (never actually scrolls), the sticky
+           bar would stick relative to a scrollport that never moves -- i.e. it
+           would silently stop floating. The header's top corners get their own
+           radius below instead, since the container no longer clips them. */
         .header {{
             background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
             color: white;
             padding: 30px;
             text-align: center;
+            border-radius: 8px 8px 0 0;
         }}
 
         .header h1 {{
@@ -1119,6 +1125,16 @@ def generate_comparison_html(file1_path: Optional[Path], file2_path: Optional[Pa
 
         .info-table {{
             width: 100%;
+            /* "auto" (the default) sizes columns to fit their longest unbroken
+               token, so a long value pushed the table wider than its .card and
+               the excess was clipped by the card's "overflow: hidden" rather
+               than wrapped -- exactly the cut-off text in the GPU tab (e.g.
+               SoC P-State policy descriptions). "fixed" forces the 35%/65%
+               split below to hold regardless of content, so long values wrap
+               inside their own cell instead of blowing out the table width.
+               Applies to nested tables too (list/dict values render as a table
+               inside a td), which is where most of the clipped text came from. */
+            table-layout: fixed;
             border-collapse: collapse;
         }}
 
@@ -1139,6 +1155,12 @@ def generate_comparison_html(file1_path: Optional[Path], file2_path: Optional[Pa
 
         .info-table td {{
             color: #212529;
+            /* Long unbroken tokens (driver strings, hex IDs, policy names) were
+               being clipped rather than wrapped, because the parent .card has
+               "overflow: hidden" for its rounded corners and a table cell's
+               default line-breaking rules only break at whitespace. */
+            overflow-wrap: anywhere;
+            word-break: break-word;
         }}
 
         .info-table tr:last-child th,
@@ -1435,10 +1457,66 @@ def generate_comparison_html(file1_path: Optional[Path], file2_path: Optional[Pa
         ul {{
             margin: 0;
             padding-left: 20px;
+            overflow-wrap: anywhere;
+            word-break: break-word;
         }}
 
         ul li {{
             margin: 5px 0;
+        }}
+
+        /* ---- Sticky nav (tabs + toolbar) and back-to-top ---- */
+        /* Tabs and the search/filter toolbar below them are the controls a reader
+           reaches for constantly while scrolled deep into a long card list (e.g.
+           the ROCm package table), so they stick as one unit rather than
+           scrolling away with the decorative title banner above them. */
+        .sticky-nav {{
+            position: sticky;
+            top: 0;
+            z-index: 20;
+            background: #f8f9fa;
+            box-shadow: 0 2px 4px rgba(0,0,0,0.08);
+        }}
+
+        body.dark .sticky-nav {{
+            background: #24272e;
+        }}
+
+        .back-to-top {{
+            position: fixed;
+            right: 24px;
+            bottom: 24px;
+            width: 44px;
+            height: 44px;
+            border-radius: 50%;
+            border: none;
+            background: #667eea;
+            color: white;
+            font-size: 1.2rem;
+            line-height: 1;
+            cursor: pointer;
+            box-shadow: 0 2px 8px rgba(0,0,0,0.25);
+            display: none;
+            align-items: center;
+            justify-content: center;
+            z-index: 30;
+            transition: background 0.2s, opacity 0.2s;
+        }}
+
+        .back-to-top.visible {{
+            display: flex;
+        }}
+
+        .back-to-top:hover {{
+            background: #5568d3;
+        }}
+
+        body.dark .back-to-top {{
+            background: #3a3f47;
+        }}
+
+        body.dark .back-to-top:hover {{
+            background: #474d57;
         }}
 
         @media (max-width: 768px) {{
@@ -1474,24 +1552,26 @@ def generate_comparison_html(file1_path: Optional[Path], file2_path: Optional[Pa
         {health_banner}
         {failures_banner}
 
-        <div class="tabs" id="tabs-container">
-            {f'<button class="tab{" active" if first_tab == "cpu" else ""}" onclick="openTab(event, ' + "'cpu'" + ')" draggable="true" data-tab="cpu">CPU</button>' if has_cpu else ''}
-            {f'<button class="tab{" active" if first_tab == "gpu" else ""}" onclick="openTab(event, ' + "'gpu'" + ')" draggable="true" data-tab="gpu">GPU</button>' if has_gpu else ''}
-            {f'<button class="tab{" active" if first_tab == "health" else ""}" onclick="openTab(event, ' + "'health'" + ')" draggable="true" data-tab="health">GPU Health</button>' if has_health else ''}
-            {f'<button class="tab{" active" if first_tab == "rocm" else ""}" onclick="openTab(event, ' + "'rocm'" + ')" draggable="true" data-tab="rocm">ROCm</button>' if has_rocm else ''}
-            {f'<button class="tab{" active" if first_tab == "network" else ""}" onclick="openTab(event, ' + "'network'" + ')" draggable="true" data-tab="network">Network</button>' if has_network else ''}
-            {f'<button class="tab{" active" if first_tab == "bmc" else ""}" onclick="openTab(event, ' + "'bmc'" + ')" draggable="true" data-tab="bmc">BMC</button>' if has_bmc else ''}
-            {f'<button class="tab{" active" if first_tab == "platform" else ""}" onclick="openTab(event, ' + "'platform'" + ')" draggable="true" data-tab="platform">Platform</button>' if has_platform else ''}
-            {f'<button class="tab{" active" if first_tab == "microbenchmarks" else ""}" onclick="openTab(event, ' + "'microbenchmarks'" + ')" draggable="true" data-tab="microbenchmarks">Microbenchmarks</button>' if has_microbenchmarks else ''}
-        </div>
+        <div class="sticky-nav">
+            <div class="tabs" id="tabs-container">
+                {f'<button class="tab{" active" if first_tab == "cpu" else ""}" onclick="openTab(event, ' + "'cpu'" + ')" draggable="true" data-tab="cpu">CPU</button>' if has_cpu else ''}
+                {f'<button class="tab{" active" if first_tab == "gpu" else ""}" onclick="openTab(event, ' + "'gpu'" + ')" draggable="true" data-tab="gpu">GPU</button>' if has_gpu else ''}
+                {f'<button class="tab{" active" if first_tab == "health" else ""}" onclick="openTab(event, ' + "'health'" + ')" draggable="true" data-tab="health">GPU Health</button>' if has_health else ''}
+                {f'<button class="tab{" active" if first_tab == "rocm" else ""}" onclick="openTab(event, ' + "'rocm'" + ')" draggable="true" data-tab="rocm">ROCm</button>' if has_rocm else ''}
+                {f'<button class="tab{" active" if first_tab == "network" else ""}" onclick="openTab(event, ' + "'network'" + ')" draggable="true" data-tab="network">Network</button>' if has_network else ''}
+                {f'<button class="tab{" active" if first_tab == "bmc" else ""}" onclick="openTab(event, ' + "'bmc'" + ')" draggable="true" data-tab="bmc">BMC</button>' if has_bmc else ''}
+                {f'<button class="tab{" active" if first_tab == "platform" else ""}" onclick="openTab(event, ' + "'platform'" + ')" draggable="true" data-tab="platform">Platform</button>' if has_platform else ''}
+                {f'<button class="tab{" active" if first_tab == "microbenchmarks" else ""}" onclick="openTab(event, ' + "'microbenchmarks'" + ')" draggable="true" data-tab="microbenchmarks">Microbenchmarks</button>' if has_microbenchmarks else ''}
+            </div>
 
-        <div class="toolbar">
-            <input type="search" id="cardSearch" class="tb-search" placeholder="Search cards and values…"
-                   aria-label="Filter cards" oninput="applyFilters()">
-            {'''<label class="tb-check"><input type="checkbox" id="diffOnly" onchange="applyFilters()"> Differences only</label>''' if is_comparison else ''}
-            <button class="tb-btn" onclick="toggleAllCards()" id="collapseAllBtn">Collapse all</button>
-            <button class="tb-btn" onclick="toggleDarkMode()" id="darkBtn">Dark mode</button>
-            <span class="tb-count" id="filterCount"></span>
+            <div class="toolbar">
+                <input type="search" id="cardSearch" class="tb-search" placeholder="Search cards and values…"
+                       aria-label="Filter cards" oninput="applyFilters()">
+                {'''<label class="tb-check"><input type="checkbox" id="diffOnly" onchange="applyFilters()"> Differences only</label>''' if is_comparison else ''}
+                <button class="tb-btn" onclick="toggleAllCards()" id="collapseAllBtn">Collapse all</button>
+                <button class="tb-btn" onclick="toggleDarkMode()" id="darkBtn">Dark mode</button>
+                <span class="tb-count" id="filterCount"></span>
+            </div>
         </div>
 
         {f'<div id="cpu" class="tab-content{" active" if first_tab == "cpu" else ""}">{cpu_content}</div>' if has_cpu else ''}
@@ -1503,6 +1583,8 @@ def generate_comparison_html(file1_path: Optional[Path], file2_path: Optional[Pa
         {f'<div id="platform" class="tab-content{" active" if first_tab == "platform" else ""}">{platform_content}</div>' if has_platform else ''}
         {f'<div id="microbenchmarks" class="tab-content{" active" if first_tab == "microbenchmarks" else ""}">{microbenchmarks_content}</div>' if has_microbenchmarks else ''}
     </div>
+
+    <button class="back-to-top" id="backToTop" onclick="window.scrollTo({{top: 0, behavior: 'smooth'}})" aria-label="Back to top" title="Back to top">↑</button>
 
     <script>
         function openTab(evt, tabName) {{
@@ -1784,6 +1866,18 @@ def generate_comparison_html(file1_path: Optional[Path], file2_path: Optional[Pa
                     applyFilters();
                 }});
             }});
+
+            // Back-to-top only makes sense once the sticky nav has actually
+            // scrolled past the header, otherwise it duplicates a control
+            // that's already on screen.
+            const backToTop = document.getElementById('backToTop');
+            if (backToTop) {{
+                const toggleBackToTop = function() {{
+                    backToTop.classList.toggle('visible', window.scrollY > 300);
+                }};
+                window.addEventListener('scroll', toggleBackToTop, {{passive: true}});
+                toggleBackToTop();
+            }}
         }});
     </script>
 </body>
