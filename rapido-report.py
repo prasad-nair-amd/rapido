@@ -372,6 +372,18 @@ _HOST_BAR_METRICS = [
     ("d2h_pinned_gbps", "Device→Host (Pinned)", "GB/s"),
 ]
 
+# Achieved rocBLAS throughput (--full). Charted separately from the naive kernel
+# GEMM above because they are different measurements by an order of magnitude and
+# plotting them on one axis would make the kernel result look like a dead GPU.
+_LIBRARY_GEMM_METRICS = [
+    ("gemm_fp32_tflops", "Library GEMM FP32 (rocBLAS)", "TFLOPS"),
+    ("gemm_fp16_tflops", "Library GEMM FP16 (rocBLAS)", "TFLOPS"),
+    ("gemm_bf16_tflops", "Library GEMM BF16 (rocBLAS)", "TFLOPS"),
+    ("gemm_fp32_efficiency_pct", "Library GEMM FP32 vs. Peak", "%"),
+    ("gemm_fp16_efficiency_pct", "Library GEMM FP16 vs. Peak", "%"),
+    ("gemm_bf16_efficiency_pct", "Library GEMM BF16 vs. Peak", "%"),
+]
+
 
 _NO_DASH = "<p class='no-data'>No chartable benchmark data</p>"
 
@@ -395,7 +407,12 @@ def _render_command_failures(sources: List[Any]) -> str:
     for label, data in sources:
         if not isinstance(data, dict):
             continue
-        failures = data.get("command_failures")
+        # The collector writes this inside "_metadata"; the top-level read is a
+        # fallback for hand-assembled or future files that hoist it out.
+        metadata = data.get("_metadata")
+        failures = (metadata.get("command_failures") if isinstance(metadata, dict) else None)
+        if not isinstance(failures, dict) or not failures:
+            failures = data.get("command_failures")
         if not isinstance(failures, dict) or not failures:
             continue
         rows = []
@@ -410,10 +427,100 @@ def _render_command_failures(sources: List[Any]) -> str:
             )
         heading = f"Collection warnings ({escape(label)})" if label else "Collection warnings"
         blocks.append(
-            f"<div class='failures'><strong>{heading}</strong>"
+            f"<div class='failures'>"
+            f"<strong onclick='toggleFailureBlock(this)'>"
+            f"<span class='toggle-arrow'>▼</span> {heading}</strong>"
+            f"<div class='failures-body'>"
             f"<p class='caption'>These commands did not complete, so the sections that "
-            f"depend on them may be missing or incomplete.</p><ul>{''.join(rows)}</ul></div>"
+            f"depend on them may be missing or incomplete.</p><ul>{''.join(rows)}</ul>"
+            f"</div></div>"
         )
+    return "".join(blocks)
+
+
+def _health_findings(data: Optional[Dict[str, Any]]) -> List[str]:
+    """The RAS and telemetry conditions that should stop an acceptance sign-off.
+
+    Deliberately narrow. Correctable ECC errors are expected on HBM and corrected in
+    hardware, and the throttle *_accumulated counters are lifetime residency totals
+    that are nonzero on any healthy board that has ever touched its power limit --
+    flagging either would make this banner fire on every node and mean nothing.
+    """
+    if not isinstance(data, dict):
+        return []
+
+    findings: List[str] = []
+
+    for card in _extract_section_data(data, "ras"):
+        if not isinstance(card, dict):
+            continue
+        raw = card.get("_raw")
+        if not isinstance(raw, dict):
+            continue
+        # The node summary carries "node_*" totals; per-GPU cards carry the rest.
+        if "node_ecc_uncorrectable" in raw:
+            continue
+        gpu = f"GPU {raw.get('gpu_id', '?')}"
+        for key, noun in (("ecc_uncorrectable", "uncorrectable ECC error"),
+                          ("bad_pages_retired", "retired memory page"),
+                          ("bad_pages_pending", "pending memory page"),
+                          ("xgmi_errors", "XGMI link error")):
+            count = raw.get(key)
+            if _is_num(count) and count > 0:
+                plural = "" if count == 1 else "s"
+                findings.append(f"{gpu}: {int(count)} {noun}{plural}")
+
+    for card in _extract_section_data(data, "telemetry"):
+        if not isinstance(card, dict):
+            continue
+        raw = card.get("_raw")
+        if not isinstance(raw, dict) or "gpu_id" not in raw:
+            continue
+        gpu = f"GPU {raw.get('gpu_id', '?')}"
+        if raw.get("pcie_degraded") is True:
+            findings.append(f"{gpu}: {card.get('PCIe Link', 'PCIe link degraded')}")
+        if raw.get("throttling_active") is True:
+            findings.append(f"{gpu}: {card.get('Throttling', 'throttling active')}")
+
+    return findings
+
+
+def _render_health_banner(sources: List[Any]) -> str:
+    """Banner summarising GPU health above the tabs.
+
+    `sources` is a list of (label, data) pairs, matching _render_command_failures;
+    the label is only printed in comparison mode. Unlike that banner this one also
+    renders when everything is clean: "no uncorrectable errors" is a result an
+    acceptance audit needs stated, not inferred from the absence of a warning.
+    """
+    blocks: List[str] = []
+    for label, data in sources:
+        if not isinstance(data, dict):
+            continue
+        # Nothing to say about a file that never collected the sections at all.
+        if not (_extract_section_data(data, "ras") or _extract_section_data(data, "telemetry")):
+            continue
+        findings = _health_findings(data)
+        suffix = f" ({escape(label)})" if label else ""
+        if findings:
+            rows = "".join(f"<li>{escape(f)}</li>" for f in findings)
+            blocks.append(
+                f"<div class='failures'>"
+                f"<strong onclick='toggleFailureBlock(this)'>"
+                f"<span class='toggle-arrow'>▼</span> GPU health{suffix}: "
+                f"{len(findings)} finding(s) requiring attention</strong>"
+                f"<div class='failures-body'>"
+                f"<p class='caption'>Uncorrectable ECC errors and retired pages are RMA "
+                f"indicators; a degraded PCIe link or active throttling will cap "
+                f"achievable performance.</p><ul>{rows}</ul>"
+                f"</div></div>"
+            )
+        else:
+            blocks.append(
+                f"<div class='health-ok'><strong>GPU health{suffix}: OK</strong> — no "
+                f"uncorrectable ECC errors, no bad pages, no degraded PCIe links and no "
+                f"active throttling at collection time.</div>"
+            )
     return "".join(blocks)
 
 
@@ -483,6 +590,31 @@ def _render_microbench_dashboard(items: List[Any]) -> str:
 
     bar_panels(_find_raw(items, "Kernel Benchmarks"), _GPU_BAR_METRICS, "")
     bar_panels(_find_raw(items, "Host Transfer Bandwidth"), _HOST_BAR_METRICS, "Host transfer ")
+    bar_panels(_find_raw(items, "Library GEMM"), _LIBRARY_GEMM_METRICS, "")
+
+    # RCCL is one node-level card rather than one per GPU, so the bars run across
+    # collectives instead of across devices and the median marker is meaningless.
+    rccl = _find_raw(items, "RCCL Collective Bandwidth")
+    if rccl:
+        raw = rccl[0]
+        pairs = sorted(
+            (key[len("rccl_"):-len("_bus_gbps")].replace("_", " ").title(), value)
+            for key, value in raw.items()
+            if isinstance(key, str) and key.startswith("rccl_") and key.endswith("_bus_gbps")
+        )
+        if pairs:
+            chart = _render_bar_chart([p[0] for p in pairs], [p[1] for p in pairs], "GB/s")
+            if chart:
+                ranks = raw.get("ranks")
+                caption = ("Bus bandwidth, the traffic actually crossing the fabric, "
+                           "at the best-performing message size")
+                if _is_num(ranks):
+                    caption += f"; {int(ranks)} ranks"
+                panels.append(
+                    f"<div class='panel'><h4>RCCL Collective Bandwidth "
+                    f"<span class='unit'>(GB/s)</span></h4>"
+                    f"<p class='caption'>{escape(caption)}.</p>{chart}</div>"
+                )
 
     if not panels:
         return ""
@@ -523,11 +655,29 @@ def _extract_section_data(data: Dict[str, Any], section: str) -> List[Dict[str, 
     return all_items
 
 
+def _extract_sections(data: Optional[Dict[str, Any]], sections: List[str]) -> List[Dict[str, Any]]:
+    """Flatten several top-level sections into one card list, in the order given.
+
+    RAS counters and live telemetry are separate collector sections because they come
+    from different amd-smi subcommands and can fail independently, but to a reader they
+    are one subject -- GPU health -- so they share a tab.
+    """
+    items: List[Dict[str, Any]] = []
+    if not isinstance(data, dict):
+        return items
+    for section in ([sections] if isinstance(sections, str) else sections):
+        items.extend(_extract_section_data(data, section))
+    return items
+
+
 def _render_comparison_section(data1: Optional[Dict[str, Any]], data2: Optional[Dict[str, Any]],
-                                section: str, section_title: str) -> str:
-    """Render a comparison section with two files side by side, highlighting differences."""
-    file1_items = _extract_section_data(data1, section) if data1 else []
-    file2_items = _extract_section_data(data2, section) if data2 else []
+                                section: Any, section_title: str) -> str:
+    """Render a comparison section with two files side by side, highlighting differences.
+
+    `section` is a top-level key, or a list of keys to be shown as one tab.
+    """
+    file1_items = _extract_sections(data1, section) if data1 else []
+    file2_items = _extract_sections(data2, section) if data2 else []
 
     # Render with cross-comparison for highlighting
     file1_html = _render_list_as_cards(file1_items, section_title, file2_items) if file1_items else "<p class='no-data'>No data available</p>"
@@ -547,9 +697,9 @@ def _render_comparison_section(data1: Optional[Dict[str, Any]], data2: Optional[
     )
 
 
-def _render_single_section(data: Dict[str, Any], section: str, section_title: str) -> str:
-    """Render a single section without comparison."""
-    items = _extract_section_data(data, section)
+def _render_single_section(data: Dict[str, Any], section: Any, section_title: str) -> str:
+    """Render a single section without comparison. `section` may be a list of keys."""
+    items = _extract_sections(data, section)
 
     if items:
         return _render_list_as_cards(items, section_title)
@@ -629,10 +779,12 @@ def generate_comparison_html(file1_path: Optional[Path], file2_path: Optional[Pa
     # Collection problems, surfaced at the top of the report. The collector records
     # why each command failed precisely so the reader can tell a missing tool apart
     # from a hung or erroring one instead of just seeing an absent section.
-    failures_banner = _render_command_failures(
-        [(file1_name, data1), (file2_name, data2)] if is_comparison else
-        [("", data1 or data2)]
-    )
+    banner_sources = ([(file1_name, data1), (file2_name, data2)] if is_comparison
+                      else [("", data1 or data2)])
+    failures_banner = _render_command_failures(banner_sources)
+    # GPU health sits above the failures banner: an uncorrectable ECC error is a
+    # verdict about the hardware, whereas a missing tool is a caveat about the report.
+    health_banner = _render_health_banner(banner_sources)
 
     # Check which sections have data in either file
     has_cpu = False
@@ -640,8 +792,14 @@ def generate_comparison_html(file1_path: Optional[Path], file2_path: Optional[Pa
     has_network = False
     has_bmc = False
     has_rocm = False
+    has_health = False
+    has_platform = False
     has_microbenchmarks = False
-    
+
+    # RAS counters and live telemetry are collected separately but read as one
+    # subject, so they share a single "GPU Health" tab.
+    health_sections = ["ras", "telemetry"]
+
     if is_comparison:
         cpu1 = _extract_section_data(data1, "cpu") if data1 else []
         cpu2 = _extract_section_data(data2, "cpu") if data2 else []
@@ -663,6 +821,14 @@ def generate_comparison_html(file1_path: Optional[Path], file2_path: Optional[Pa
         rocm2 = _extract_section_data(data2, "rocm") if data2 else []
         has_rocm = bool(rocm1 or rocm2)
         
+        health1 = _extract_sections(data1, health_sections) if data1 else []
+        health2 = _extract_sections(data2, health_sections) if data2 else []
+        has_health = bool(health1 or health2)
+
+        platform1 = _extract_section_data(data1, "platform") if data1 else []
+        platform2 = _extract_section_data(data2, "platform") if data2 else []
+        has_platform = bool(platform1 or platform2)
+
         microbench1 = _extract_section_data(data1, "microbenchmarks") if data1 else []
         microbench2 = _extract_section_data(data2, "microbenchmarks") if data2 else []
         has_microbenchmarks = bool(microbench1 or microbench2)
@@ -673,6 +839,8 @@ def generate_comparison_html(file1_path: Optional[Path], file2_path: Optional[Pa
         has_network = bool(_extract_section_data(active_data, "network"))
         has_bmc = bool(_extract_section_data(active_data, "bmc"))
         has_rocm = bool(_extract_section_data(active_data, "rocm"))
+        has_health = bool(_extract_sections(active_data, health_sections))
+        has_platform = bool(_extract_section_data(active_data, "platform"))
         has_microbenchmarks = bool(_extract_section_data(active_data, "microbenchmarks"))
 
     # Determine which tab should be active by default (first available tab)
@@ -681,23 +849,30 @@ def generate_comparison_html(file1_path: Optional[Path], file2_path: Optional[Pa
         first_tab = "cpu"
     elif has_gpu:
         first_tab = "gpu"
+    elif has_health:
+        first_tab = "health"
     elif has_rocm:
         first_tab = "rocm"
     elif has_network:
         first_tab = "network"
     elif has_bmc:
         first_tab = "bmc"
+    elif has_platform:
+        first_tab = "platform"
     elif has_microbenchmarks:
         first_tab = "microbenchmarks"
-    
+
     # Generate tab content only for sections that have data
     cpu_content = ""
     gpu_content = ""
     network_content = ""
     bmc_content = ""
     rocm_content = ""
+    health_content = ""
+    platform_content = ""
     microbenchmarks_content = ""
-    
+
+
     if is_comparison:
         if has_cpu:
             cpu_content = _render_comparison_section(data1, data2, "cpu", "CPU")
@@ -709,6 +884,10 @@ def generate_comparison_html(file1_path: Optional[Path], file2_path: Optional[Pa
             bmc_content = _render_comparison_section(data1, data2, "bmc", "BMC")
         if has_rocm:
             rocm_content = _render_comparison_section(data1, data2, "rocm", "ROCm")
+        if has_health:
+            health_content = _render_comparison_section(data1, data2, health_sections, "GPU Health")
+        if has_platform:
+            platform_content = _render_comparison_section(data1, data2, "platform", "Platform")
         if has_microbenchmarks:
             # Dashboards sit side by side above the cards, mirroring the card layout.
             dash1 = _render_microbench_dashboard(microbench1)
@@ -735,6 +914,10 @@ def generate_comparison_html(file1_path: Optional[Path], file2_path: Optional[Pa
             bmc_content = _render_single_section(active_data, "bmc", "BMC")
         if has_rocm:
             rocm_content = _render_single_section(active_data, "rocm", "ROCm")
+        if has_health:
+            health_content = _render_single_section(active_data, health_sections, "GPU Health")
+        if has_platform:
+            platform_content = _render_single_section(active_data, "platform", "Platform")
         if has_microbenchmarks:
             microbench_items = _extract_section_data(active_data, "microbenchmarks")
             microbenchmarks_content = (
@@ -768,14 +951,20 @@ def generate_comparison_html(file1_path: Optional[Path], file2_path: Optional[Pa
             background: white;
             border-radius: 8px;
             box-shadow: 0 2px 4px rgba(0,0,0,0.1);
-            overflow: hidden;
         }}
 
+        /* No "overflow: hidden" on .container: that property turns it into the
+           containing block for "position: sticky" descendants, and since the
+           container's height is intrinsic (never actually scrolls), the sticky
+           bar would stick relative to a scrollport that never moves -- i.e. it
+           would silently stop floating. The header's top corners get their own
+           radius below instead, since the container no longer clips them. */
         .header {{
             background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
             color: white;
             padding: 30px;
             text-align: center;
+            border-radius: 8px 8px 0 0;
         }}
 
         .header h1 {{
@@ -944,6 +1133,16 @@ def generate_comparison_html(file1_path: Optional[Path], file2_path: Optional[Pa
 
         .info-table {{
             width: 100%;
+            /* "auto" (the default) sizes columns to fit their longest unbroken
+               token, so a long value pushed the table wider than its .card and
+               the excess was clipped by the card's "overflow: hidden" rather
+               than wrapped -- exactly the cut-off text in the GPU tab (e.g.
+               SoC P-State policy descriptions). "fixed" forces the 35%/65%
+               split below to hold regardless of content, so long values wrap
+               inside their own cell instead of blowing out the table width.
+               Applies to nested tables too (list/dict values render as a table
+               inside a td), which is where most of the clipped text came from. */
+            table-layout: fixed;
             border-collapse: collapse;
         }}
 
@@ -964,6 +1163,12 @@ def generate_comparison_html(file1_path: Optional[Path], file2_path: Optional[Pa
 
         .info-table td {{
             color: #212529;
+            /* Long unbroken tokens (driver strings, hex IDs, policy names) were
+               being clipped rather than wrapped, because the parent .card has
+               "overflow: hidden" for its rounded corners and a table cell's
+               default line-breaking rules only break at whitespace. */
+            overflow-wrap: anywhere;
+            word-break: break-word;
         }}
 
         .info-table tr:last-child th,
@@ -1113,6 +1318,11 @@ def generate_comparison_html(file1_path: Optional[Path], file2_path: Optional[Pa
             background: rgba(255, 255, 255, 0.1);
         }}
 
+        body.dark .health-ok {{
+            background: #1c3320;
+            color: #a8dcae;
+        }}
+
         /* ---- Microbenchmark dashboard ---- */
         .dashboard {{
             background: white;
@@ -1213,6 +1423,22 @@ def generate_comparison_html(file1_path: Optional[Path], file2_path: Optional[Pa
             font-size: 0.9rem;
         }}
 
+        .failures > strong {{
+            cursor: pointer;
+            display: block;
+            user-select: none;
+        }}
+
+        .toggle-arrow {{
+            display: inline-block;
+            width: 1em;
+            font-size: 0.8em;
+        }}
+
+        .failures.collapsed .failures-body {{
+            display: none;
+        }}
+
         .failures ul {{
             margin: 8px 0 0 18px;
         }}
@@ -1232,6 +1458,19 @@ def generate_comparison_html(file1_path: Optional[Path], file2_path: Optional[Pa
             opacity: 0.8;
         }}
 
+        /* The clean counterpart to .failures. Green rather than red because a
+           clean RAS/telemetry result is a positive finding worth stating, not
+           merely the absence of a warning. */
+        .health-ok {{
+            background: #e8f5e9;
+            border-left: 4px solid #2e7d32;
+            border-radius: 4px;
+            margin-bottom: 16px;
+            padding: 12px 16px;
+            color: #1b4620;
+            font-size: 0.9rem;
+        }}
+
         .no-data {{
             text-align: center;
             padding: 40px;
@@ -1242,10 +1481,66 @@ def generate_comparison_html(file1_path: Optional[Path], file2_path: Optional[Pa
         ul {{
             margin: 0;
             padding-left: 20px;
+            overflow-wrap: anywhere;
+            word-break: break-word;
         }}
 
         ul li {{
             margin: 5px 0;
+        }}
+
+        /* ---- Sticky nav (tabs + toolbar) and back-to-top ---- */
+        /* Tabs and the search/filter toolbar below them are the controls a reader
+           reaches for constantly while scrolled deep into a long card list (e.g.
+           the ROCm package table), so they stick as one unit rather than
+           scrolling away with the decorative title banner above them. */
+        .sticky-nav {{
+            position: sticky;
+            top: 0;
+            z-index: 20;
+            background: #f8f9fa;
+            box-shadow: 0 2px 4px rgba(0,0,0,0.08);
+        }}
+
+        body.dark .sticky-nav {{
+            background: #24272e;
+        }}
+
+        .back-to-top {{
+            position: fixed;
+            right: 24px;
+            bottom: 24px;
+            width: 44px;
+            height: 44px;
+            border-radius: 50%;
+            border: none;
+            background: #667eea;
+            color: white;
+            font-size: 1.2rem;
+            line-height: 1;
+            cursor: pointer;
+            box-shadow: 0 2px 8px rgba(0,0,0,0.25);
+            display: none;
+            align-items: center;
+            justify-content: center;
+            z-index: 30;
+            transition: background 0.2s, opacity 0.2s;
+        }}
+
+        .back-to-top.visible {{
+            display: flex;
+        }}
+
+        .back-to-top:hover {{
+            background: #5568d3;
+        }}
+
+        body.dark .back-to-top {{
+            background: #3a3f47;
+        }}
+
+        body.dark .back-to-top:hover {{
+            background: #474d57;
         }}
 
         @media (max-width: 768px) {{
@@ -1278,33 +1573,42 @@ def generate_comparison_html(file1_path: Optional[Path], file2_path: Optional[Pa
             </div>''' if (command_line1 or command_line2) else ''}
         </div>
 
+        {health_banner}
         {failures_banner}
 
-        <div class="tabs" id="tabs-container">
-            {f'<button class="tab{" active" if first_tab == "cpu" else ""}" onclick="openTab(event, ' + "'cpu'" + ')" draggable="true" data-tab="cpu">CPU</button>' if has_cpu else ''}
-            {f'<button class="tab{" active" if first_tab == "gpu" else ""}" onclick="openTab(event, ' + "'gpu'" + ')" draggable="true" data-tab="gpu">GPU</button>' if has_gpu else ''}
-            {f'<button class="tab{" active" if first_tab == "rocm" else ""}" onclick="openTab(event, ' + "'rocm'" + ')" draggable="true" data-tab="rocm">ROCm</button>' if has_rocm else ''}
-            {f'<button class="tab{" active" if first_tab == "network" else ""}" onclick="openTab(event, ' + "'network'" + ')" draggable="true" data-tab="network">Network</button>' if has_network else ''}
-            {f'<button class="tab{" active" if first_tab == "bmc" else ""}" onclick="openTab(event, ' + "'bmc'" + ')" draggable="true" data-tab="bmc">BMC</button>' if has_bmc else ''}
-            {f'<button class="tab{" active" if first_tab == "microbenchmarks" else ""}" onclick="openTab(event, ' + "'microbenchmarks'" + ')" draggable="true" data-tab="microbenchmarks">Microbenchmarks</button>' if has_microbenchmarks else ''}
-        </div>
+        <div class="sticky-nav">
+            <div class="tabs" id="tabs-container">
+                {f'<button class="tab{" active" if first_tab == "cpu" else ""}" onclick="openTab(event, ' + "'cpu'" + ')" draggable="true" data-tab="cpu">CPU</button>' if has_cpu else ''}
+                {f'<button class="tab{" active" if first_tab == "gpu" else ""}" onclick="openTab(event, ' + "'gpu'" + ')" draggable="true" data-tab="gpu">GPU</button>' if has_gpu else ''}
+                {f'<button class="tab{" active" if first_tab == "health" else ""}" onclick="openTab(event, ' + "'health'" + ')" draggable="true" data-tab="health">GPU Health</button>' if has_health else ''}
+                {f'<button class="tab{" active" if first_tab == "rocm" else ""}" onclick="openTab(event, ' + "'rocm'" + ')" draggable="true" data-tab="rocm">ROCm</button>' if has_rocm else ''}
+                {f'<button class="tab{" active" if first_tab == "network" else ""}" onclick="openTab(event, ' + "'network'" + ')" draggable="true" data-tab="network">Network</button>' if has_network else ''}
+                {f'<button class="tab{" active" if first_tab == "bmc" else ""}" onclick="openTab(event, ' + "'bmc'" + ')" draggable="true" data-tab="bmc">BMC</button>' if has_bmc else ''}
+                {f'<button class="tab{" active" if first_tab == "platform" else ""}" onclick="openTab(event, ' + "'platform'" + ')" draggable="true" data-tab="platform">Platform</button>' if has_platform else ''}
+                {f'<button class="tab{" active" if first_tab == "microbenchmarks" else ""}" onclick="openTab(event, ' + "'microbenchmarks'" + ')" draggable="true" data-tab="microbenchmarks">Microbenchmarks</button>' if has_microbenchmarks else ''}
+            </div>
 
-        <div class="toolbar">
-            <input type="search" id="cardSearch" class="tb-search" placeholder="Search cards and values…"
-                   aria-label="Filter cards" oninput="applyFilters()">
-            {'''<label class="tb-check"><input type="checkbox" id="diffOnly" onchange="applyFilters()"> Differences only</label>''' if is_comparison else ''}
-            <button class="tb-btn" onclick="toggleAllCards()" id="collapseAllBtn">Collapse all</button>
-            <button class="tb-btn" onclick="toggleDarkMode()" id="darkBtn">Dark mode</button>
-            <span class="tb-count" id="filterCount"></span>
+            <div class="toolbar">
+                <input type="search" id="cardSearch" class="tb-search" placeholder="Search cards and values…"
+                       aria-label="Filter cards" oninput="applyFilters()">
+                {'''<label class="tb-check"><input type="checkbox" id="diffOnly" onchange="applyFilters()"> Differences only</label>''' if is_comparison else ''}
+                <button class="tb-btn" onclick="toggleAllCards()" id="collapseAllBtn">Collapse all</button>
+                <button class="tb-btn" onclick="toggleDarkMode()" id="darkBtn">Dark mode</button>
+                <span class="tb-count" id="filterCount"></span>
+            </div>
         </div>
 
         {f'<div id="cpu" class="tab-content{" active" if first_tab == "cpu" else ""}">{cpu_content}</div>' if has_cpu else ''}
         {f'<div id="gpu" class="tab-content{" active" if first_tab == "gpu" else ""}">{gpu_content}</div>' if has_gpu else ''}
+        {f'<div id="health" class="tab-content{" active" if first_tab == "health" else ""}">{health_content}</div>' if has_health else ''}
         {f'<div id="rocm" class="tab-content{" active" if first_tab == "rocm" else ""}">{rocm_content}</div>' if has_rocm else ''}
         {f'<div id="network" class="tab-content{" active" if first_tab == "network" else ""}">{network_content}</div>' if has_network else ''}
         {f'<div id="bmc" class="tab-content{" active" if first_tab == "bmc" else ""}">{bmc_content}</div>' if has_bmc else ''}
+        {f'<div id="platform" class="tab-content{" active" if first_tab == "platform" else ""}">{platform_content}</div>' if has_platform else ''}
         {f'<div id="microbenchmarks" class="tab-content{" active" if first_tab == "microbenchmarks" else ""}">{microbenchmarks_content}</div>' if has_microbenchmarks else ''}
     </div>
+
+    <button class="back-to-top" id="backToTop" onclick="window.scrollTo({{top: 0, behavior: 'smooth'}})" aria-label="Back to top" title="Back to top">↑</button>
 
     <script>
         function openTab(evt, tabName) {{
@@ -1506,6 +1810,17 @@ def generate_comparison_html(file1_path: Optional[Path], file2_path: Optional[Pa
             header.parentElement.classList.toggle('collapsed');
         }}
 
+        // Shared by the red .failures and green .health-ok banners: the heading
+        // and caption stay visible, only the list of individual findings collapses.
+        function toggleFailureBlock(header) {{
+            const block = header.parentElement;
+            block.classList.toggle('collapsed');
+            const arrow = header.querySelector('.toggle-arrow');
+            if (arrow) {{
+                arrow.textContent = block.classList.contains('collapsed') ? '▶' : '▼';
+            }}
+        }}
+
         // Space/Enter on a focused header, since the header is a div with
         // role="button" and gets no native keyboard activation.
         function cardKey(event, header) {{
@@ -1586,6 +1901,18 @@ def generate_comparison_html(file1_path: Optional[Path], file2_path: Optional[Pa
                     applyFilters();
                 }});
             }});
+
+            // Back-to-top only makes sense once the sticky nav has actually
+            // scrolled past the header, otherwise it duplicates a control
+            // that's already on screen.
+            const backToTop = document.getElementById('backToTop');
+            if (backToTop) {{
+                const toggleBackToTop = function() {{
+                    backToTop.classList.toggle('visible', window.scrollY > 300);
+                }};
+                window.addEventListener('scroll', toggleBackToTop, {{passive: true}});
+                toggleBackToTop();
+            }}
         }});
     </script>
 </body>

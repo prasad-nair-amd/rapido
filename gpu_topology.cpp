@@ -3,6 +3,7 @@
 // Compile: hipcc -o gpu_topology gpu_topology.cpp
 
 #include <hip/hip_runtime.h>
+#include <chrono>
 #include <iostream>
 #include <iomanip>
 #include <vector>

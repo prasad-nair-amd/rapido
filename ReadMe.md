@@ -44,6 +44,7 @@ python3 rapido-collect.py -n           # Network only
 python3 rapido-collect.py -b           # BMC only (may require sudo)
 python3 rapido-collect.py -r           # ROCm only
 python3 rapido-collect.py -m           # Microbenchmarks only (automatically includes ROCm)
+python3 rapido-collect.py -t           # Host platform only (BIOS/DMI, EDAC, NUMA, tuning, affinity)
 
 # Combine multiple sections
 python3 rapido-collect.py -c -g        # CPU and GPU only
@@ -52,6 +53,10 @@ python3 rapido-collect.py -g -r        # GPU and ROCm only
 
 # With GPU P2P bandwidth testing (requires -m)
 python3 rapido-collect.py -m -p
+
+# With the heavy library benchmarks as well: rocBLAS achieved GEMM and RCCL
+# collectives. Adds a few minutes; the default -m run is unchanged without it.
+python3 rapido-collect.py -m --full
 
 # Verbose mode - shows tool availability check and progress messages
 python3 rapido-collect.py -v
@@ -69,7 +74,7 @@ python3 rapido-report.py -f1 serverinfo_$(hostname)_before.json \
                          -f2 serverinfo_$(hostname)_after.json
 
 # Full collection with all features and verbose output
-sudo python3 rapido-collect.py -a -p -v
+sudo python3 rapido-collect.py -a -m -p --full -v
 ```
 
 ### Report Generation
@@ -92,8 +97,15 @@ python3 rapido-report.py -i serverinfo_server1.json -o report.html
 - Works across all sections: CPU, GPU, ROCm, Network, BMC, and Microbenchmarks
 
 **Report Features** (single and comparison mode):
+- **GPU health banner** above the tabs: uncorrectable ECC errors, bad pages, XGMI errors,
+  degraded PCIe links and active throttling. Renders a green "OK" when clean, because
+  "no uncorrectable errors" is a result an acceptance audit needs stated, not inferred
+- **GPU Health tab** (RAS counters and live telemetry) and **Platform tab** (BIOS, EDAC,
+  NUMA, kernel tuning, device affinity)
 - **Microbenchmark dashboard**: P2P bandwidth heatmap and per-GPU bar charts, with
-  automatic flagging of any GPU or link deviating more than 15% from the node median
+  automatic flagging of any GPU or link deviating more than 15% from the node median;
+  under `--full`, also achieved rocBLAS GEMM (absolute and as a percentage of the
+  theoretical peak) and RCCL collective bus bandwidth
 - **Search** across all cards, **collapsible cards**, **dark mode**, deep-linkable tabs
 - Still a single self-contained HTML file - no external assets, renders offline
 
@@ -104,12 +116,16 @@ hipcc -o gpu_p2p_bandwidth gpu_p2p_bandwidth.cpp
 hipcc -O3 -o gpu_kernel_benchmarks gpu_kernel_benchmarks.cpp
 hipcc -o gpu_host_bandwidth gpu_host_bandwidth.cpp
 hipcc -o gpu_topology gpu_topology.cpp
+hipcc -O3 -o gpu_gemm_library gpu_gemm_library.cpp -lrocblas
+hipcc -O3 -o gpu_rccl_collectives gpu_rccl_collectives.cpp -lrccl
 
 # Run directly (optional - rapido-collect.py does this automatically)
 ./gpu_p2p_bandwidth
 ./gpu_kernel_benchmarks
 ./gpu_host_bandwidth
 ./gpu_topology
+./gpu_gemm_library        # only run by the collector under --full
+./gpu_rccl_collectives    # only run by the collector under --full
 ```
 
 ## Architecture
@@ -139,10 +155,13 @@ hipcc -o gpu_topology gpu_topology.cpp
 - `-b` or `--bmc`: Collect BMC information only
 - `-r` or `--rocm`: Collect ROCm information only
 - `-m` or `--microbenchmarks`: Collect microbenchmarks only (automatically includes ROCm)
-- `-a` or `--all`: Collect all basic sections: CPU, GPU, Network, BMC, ROCm (NOT microbenchmarks)
+- `-t` or `--platform`: Collect host platform information only (BIOS/DMI, EDAC, NUMA, kernel tuning, GPU/NIC affinity)
+- `-a` or `--all`: Collect all basic sections: CPU, GPU, Network, BMC, ROCm, Platform (NOT microbenchmarks)
+- `--full`: With `-m`, also run the heavy library benchmarks (rocBLAS GEMM, RCCL collectives)
 - Flags can be combined: `-c -g -n` collects CPU, GPU, and Network only
 - When any specific flag is used, only those sections are collected
-- When no flags or `-a` is used, all basic sections are collected (CPU, GPU, Network, BMC, ROCm)
+- When no flags or `-a` is used, all basic sections are collected (CPU, GPU, Network, BMC, ROCm, Platform)
+- RAS/ECC health and live telemetry ride along with `-g`: they are GPU state, not benchmarks, and are cheap
 - **Important**: Microbenchmarks are ONLY collected when `-m` flag is explicitly specified
 - Note: `-m` flag automatically enables ROCm collection (microbenchmarks need ROCm info)
 
@@ -162,6 +181,38 @@ hipcc -o gpu_topology gpu_topology.cpp
   `timeout`, or `error` - so an empty section can be explained rather than being
   mistaken for "this machine has no such hardware"
 - Timeouts are always reported at the end of the run; errors are shown with `-v`
+
+**GPU health (`ras` and `telemetry` sections, collected with `-g`)**:
+- `gather_ras_health()`: ECC correctable/uncorrectable/deferred counts per GPU and per block,
+  retired/pending/unreservable memory pages, and XGMI link errors, plus a node summary.
+  Blocks the ASIC does not instrument (`amd-smi` reports them as the *string* `"N/A"`)
+  are listed as "Not Instrumented" rather than being counted as zero.
+- `gather_gpu_telemetry()`: a point-in-time snapshot of power, temperature, clocks and
+  utilisation, and two derived verdicts:
+  - **PCIe link**: the currently trained width/speed compared against the static maximum
+    already collected, so a card that trained to x8 in an x16 slot is called out as
+    `DEGRADED` instead of hiding behind a plausible-looking "x8".
+  - **Throttling**: only the present-tense `*_violation_status` fields are flagged. The
+    `*_accumulated` counters are lifetime residency totals that are nonzero on any healthy
+    board that has ever touched its power limit, so they are reported as context only.
+- One targeted `amd-smi` invocation per metric group, no polling loop.
+
+**Partition mode** (folded into the GPU section): accelerator mode (SPX/DPX/CPX) and memory
+mode (NPS1/2/4) per device, with a summary that flags non-uniform configurations. Recorded as
+context, not as a correction: each partition is enumerated as its own device, so the reported
+CU counts and peak figures are already per-partition.
+
+**Host platform (`platform` section, `-t`)**: `gather_platform_details()` reads unprivileged
+sysfs only - no `sudo`, no prompts, nothing that can hang an unattended run:
+- BIOS vendor/version/date and board model from `/sys/class/dmi/id`
+- Host memory controllers and their EDAC correctable/uncorrectable counts
+- NUMA node CPU lists, memory, and the distance matrix
+- Kernel tuning: IOMMU boot parameters, transparent hugepages, cpufreq governor and driver,
+  boost, cpuidle driver, SMT, automatic NUMA balancing
+- GPU/NIC NUMA affinity map and a locality verdict
+- Deliberately **descriptive, not prescriptive**: settings are reported as found, because the
+  right values depend on the deployment (an SR-IOV host legitimately needs full IOMMU
+  translation). Per-DIMM population needs root and its absence is recorded explicitly.
 
 **Error handling and crash protection**:
 - Each section has individual error handling - if one section fails, others continue
@@ -392,6 +443,59 @@ hipcc -o gpu_topology gpu_topology.cpp
 - Link types and hop counts for each connection
 - Summary of XGMI vs PCIe links
 
+### gpu_gemm_library.cpp (rocBLAS achieved GEMM)
+**Purpose**: Measures the throughput a *tuned library* reaches, which is the only
+honest basis for an efficiency verdict
+
+`gpu_kernel_benchmarks.cpp` runs a naive hand-written GEMM. That is useful as a
+smoke test but it reaches single-digit percentages of the hardware peak, so
+dividing it by the theoretical peak understates the GPU by more than an order of
+magnitude. This benchmark calls rocBLAS instead and reports both the achieved
+TFLOPS and the ratio against the Tier 1 theoretical peak.
+
+**Features**:
+1. **FP32** via `rocblas_sgemm`
+2. **FP16 and BF16** via `rocblas_gemm_ex` with an FP32 compute type, which is
+   what exercises the MFMA matrix cores
+3. **Two square sizes** (4096 and 8192) - 8192 is large enough to reach steady
+   state, 4096 shows whether the smaller problem is already saturating
+4. **Every visible GPU** is measured, so a single slow device is visible rather
+   than averaged away
+5. 3 warmup plus 10 timed iterations per case
+
+FP8 is deliberately out of scope: `rocblas_gemm_ex` cannot express it, and the
+gfx942 path needs hipBLASLt with AMD-specific FNUZ types.
+
+**Output**: JSON with per-GPU achieved TFLOPS per precision and size, plus the
+efficiency percentage against the theoretical peak
+
+Only compiled and run when the collector is given `--full`, because it adds
+minutes to a run.
+
+### gpu_rccl_collectives.cpp (RCCL collective bandwidth)
+**Purpose**: Measures multi-GPU collective bandwidth, the number that actually
+predicts distributed training scaling
+
+**Features**:
+1. **All-reduce, all-gather, reduce-scatter** across every visible GPU
+2. **Single process, no MPI and no rccl-tests** - `ncclCommInitAll` builds one
+   communicator over all local devices, so there is nothing extra to install
+3. **Bus bandwidth as well as algorithmic bandwidth**, applying the standard
+   `2(n-1)/n` correction for all-reduce and `(n-1)/n` for the other two. Bus
+   bandwidth is the figure comparable against the interconnect's rated speed
+4. **Two message sizes** (16 MB and 256 MB): the small case exposes latency, the
+   large case exposes steady-state bandwidth, and a node can look fine on one
+   while being bad on the other
+
+Detection is by library presence (`librccl.so` / `rccl.h`), not by probing for an
+executable - RCCL is a library and has no binary to run. On a single-GPU host the
+benchmark reports a skip rather than a meaningless one-rank result.
+
+**Output**: JSON with per-collective, per-size algorithmic and bus bandwidth in
+GB/s, the rank count, and the RCCL version
+
+Only compiled and run when the collector is given `--full`.
+
 ### storage_benchmark.py (Storage I/O profiling)
 **Purpose**: Comprehensive storage system analysis for HPC/AI workloads
 
@@ -519,6 +623,10 @@ hipcc -o gpu_topology gpu_topology.cpp
 - `ipmitool` - BMC information collection
 - `ethtool` - Enhanced network details
 - `hipcc` - Compiling GPU P2P benchmark
+- `numactl` - NUMA distance matrix in the platform section (the rest of that
+  section comes from sysfs and needs no extra tools)
+- `rocblas` and `rccl` development headers/libraries - only needed for `--full`;
+  both ship with a standard ROCm install
 
 **System-specific tools**:
 - Linux: `lscpu`, `ip`, `rocminfo`, `clinfo`, `lsmod`, `modinfo`
@@ -537,4 +645,90 @@ hipcc -o gpu_topology gpu_topology.cpp
 
 **Tab ordering**: JavaScript drag-and-drop allows users to reorder tabs, persists to localStorage per-browser
 
+## Web Console
+
+**rapido-console.py** is a browser-based front end for collection + reporting, run
+from your own workstation rather than on the target host. It drives one or two
+remote machines over SSH, so you don't need to log into them by hand or copy
+files around yourself.
+
+Install its dependencies (not needed for the CLI tools themselves):
+
+```bash
+pip install -r requirements.txt
+```
+
+Launch it:
+
+```bash
+python rapido-console.py               # http://127.0.0.1:5000
+python rapido-console.py --port 8080    # custom port
+python rapido-console.py --host 0.0.0.0 --port 8080   # listen on all interfaces
+```
+
+Then open the printed URL in a browser. The form lets you:
+
+- Enter hostname/IP, port, username, and either a password or an identity key
+  file path for host 1.
+- Optionally tick "enable second host" *before* starting a run to add a host 2
+  with its own credentials — a host can't be added once collection has begun.
+- Tick which sections to collect (CPU, GPU, GPU health, ROCm, network, BMC,
+  platform, microbenchmarks), matching `rapido-collect.py`'s own flags.
+- Start the run and watch a live-scrolling status feed (via Server-Sent
+  Events) of what's happening on each remote host.
+- Once collection and retrieval finish, a "View report" link appears to the
+  HTML report generated locally (comparison mode automatically if two hosts
+  ran).
+
+**Assumptions**: the target host has `python3` on its `$PATH` and is reachable
+over SSH; the console uploads its own local copy of `rapido-collect.py` to a
+per-job temp directory on the remote host (`~/.rapido-console/<job_id>/`), so
+the remote machine doesn't need to have the script pre-staged.
+
+**Credentials are never persisted.** Passwords and key file paths supplied
+through the form are held only in memory for the lifetime of a job and are
+never written to disk or logged. Retrieved JSON files and generated reports
+are written under `console_runs/<job_id>/` (gitignored, local scratch only).
+
+**Live status is best-effort.** `rapido-collect.py` only emits genuine
+line-by-line progress for microbenchmarks (`-m`); other sections mostly print
+just an upfront tool-availability banner and then go quiet until they finish
+or fail. The console fills the silent stretches with its own bracketing
+status lines ("Connecting...", "Running rapido-collect.py -g -t...",
+"Retrieving JSON...") so the feed always shows *something* moving, but this
+is not the same as true per-command progress from the collector itself.
+
 **Performance**: Full collection with `-m -p` on 8-GPU system takes ~1-2 minutes due to P2P tests (56 pairs × benchmark time)
+
+### AI audit summary (optional)
+
+Tick "Generate AI audit summary" on the form to have the console send the
+collected JSON to Claude and get back a narrative audit — an overall verdict,
+findings by area (ECC/RAS, PCIe link state, throttling, missing tools,
+benchmark results vs. peak), and a short list of recommended follow-up
+actions — spliced into the generated `report.html` as its own first tab
+("AI Audit Summary", active by default when the report loads), alongside a
+direct "View AI audit summary" link.
+
+This uses the Claude Code CLI already installed on this workstation
+(`claude.exe`), not a separate API key, so it inherits whatever account you're
+already signed into. **One-time setup**: run
+
+```bash
+claude /login
+```
+
+once, outside the console, before ticking the checkbox for the first time. If
+that hasn't been done, the job still completes normally — the mechanical
+report and its "View report" link are unaffected — but a warning line appears
+in the status feed ("Claude CLI is not logged in on this machine...") and no
+audit summary or link is produced. A failed audit step never fails the job.
+
+### Identity key: browse or type a path
+
+For key-based auth, either click "Choose File" to browse to a private key on
+the machine running your browser (its contents are read client-side and sent
+with the job — never written to disk on this workstation), or type a path
+under "or type a path valid on the machine running this console" if the key
+already lives somewhere accessible to `rapido-console.py` itself. Enter a
+passphrase alongside either option if the key needs one.
