@@ -641,4 +641,90 @@ Only compiled and run when the collector is given `--full`.
 
 **Tab ordering**: JavaScript drag-and-drop allows users to reorder tabs, persists to localStorage per-browser
 
+## Web Console
+
+**rapido-console.py** is a browser-based front end for collection + reporting, run
+from your own workstation rather than on the target host. It drives one or two
+remote machines over SSH, so you don't need to log into them by hand or copy
+files around yourself.
+
+Install its dependencies (not needed for the CLI tools themselves):
+
+```bash
+pip install -r requirements.txt
+```
+
+Launch it:
+
+```bash
+python rapido-console.py               # http://127.0.0.1:5000
+python rapido-console.py --port 8080    # custom port
+python rapido-console.py --host 0.0.0.0 --port 8080   # listen on all interfaces
+```
+
+Then open the printed URL in a browser. The form lets you:
+
+- Enter hostname/IP, port, username, and either a password or an identity key
+  file path for host 1.
+- Optionally tick "enable second host" *before* starting a run to add a host 2
+  with its own credentials — a host can't be added once collection has begun.
+- Tick which sections to collect (CPU, GPU, GPU health, ROCm, network, BMC,
+  platform, microbenchmarks), matching `rapido-collect.py`'s own flags.
+- Start the run and watch a live-scrolling status feed (via Server-Sent
+  Events) of what's happening on each remote host.
+- Once collection and retrieval finish, a "View report" link appears to the
+  HTML report generated locally (comparison mode automatically if two hosts
+  ran).
+
+**Assumptions**: the target host has `python3` on its `$PATH` and is reachable
+over SSH; the console uploads its own local copy of `rapido-collect.py` to a
+per-job temp directory on the remote host (`~/.rapido-console/<job_id>/`), so
+the remote machine doesn't need to have the script pre-staged.
+
+**Credentials are never persisted.** Passwords and key file paths supplied
+through the form are held only in memory for the lifetime of a job and are
+never written to disk or logged. Retrieved JSON files and generated reports
+are written under `console_runs/<job_id>/` (gitignored, local scratch only).
+
+**Live status is best-effort.** `rapido-collect.py` only emits genuine
+line-by-line progress for microbenchmarks (`-m`); other sections mostly print
+just an upfront tool-availability banner and then go quiet until they finish
+or fail. The console fills the silent stretches with its own bracketing
+status lines ("Connecting...", "Running rapido-collect.py -g -t...",
+"Retrieving JSON...") so the feed always shows *something* moving, but this
+is not the same as true per-command progress from the collector itself.
+
 **Performance**: Full collection with `-m -p` on 8-GPU system takes ~1-2 minutes due to P2P tests (56 pairs × benchmark time)
+
+### AI audit summary (optional)
+
+Tick "Generate AI audit summary" on the form to have the console send the
+collected JSON to Claude and get back a narrative audit — an overall verdict,
+findings by area (ECC/RAS, PCIe link state, throttling, missing tools,
+benchmark results vs. peak), and a short list of recommended follow-up
+actions — spliced into the generated `report.html` as its own first tab
+("AI Audit Summary", active by default when the report loads), alongside a
+direct "View AI audit summary" link.
+
+This uses the Claude Code CLI already installed on this workstation
+(`claude.exe`), not a separate API key, so it inherits whatever account you're
+already signed into. **One-time setup**: run
+
+```bash
+claude /login
+```
+
+once, outside the console, before ticking the checkbox for the first time. If
+that hasn't been done, the job still completes normally — the mechanical
+report and its "View report" link are unaffected — but a warning line appears
+in the status feed ("Claude CLI is not logged in on this machine...") and no
+audit summary or link is produced. A failed audit step never fails the job.
+
+### Identity key: browse or type a path
+
+For key-based auth, either click "Choose File" to browse to a private key on
+the machine running your browser (its contents are read client-side and sent
+with the job — never written to disk on this workstation), or type a path
+under "or type a path valid on the machine running this console" if the key
+already lives somewhere accessible to `rapido-console.py` itself. Enter a
+passphrase alongside either option if the key needs one.

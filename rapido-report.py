@@ -427,9 +427,13 @@ def _render_command_failures(sources: List[Any]) -> str:
             )
         heading = f"Collection warnings ({escape(label)})" if label else "Collection warnings"
         blocks.append(
-            f"<div class='failures'><strong>{heading}</strong>"
+            f"<div class='failures'>"
+            f"<strong onclick='toggleFailureBlock(this)'>"
+            f"<span class='toggle-arrow'>▼</span> {heading}</strong>"
+            f"<div class='failures-body'>"
             f"<p class='caption'>These commands did not complete, so the sections that "
-            f"depend on them may be missing or incomplete.</p><ul>{''.join(rows)}</ul></div>"
+            f"depend on them may be missing or incomplete.</p><ul>{''.join(rows)}</ul>"
+            f"</div></div>"
         )
     return "".join(blocks)
 
@@ -501,11 +505,15 @@ def _render_health_banner(sources: List[Any]) -> str:
         if findings:
             rows = "".join(f"<li>{escape(f)}</li>" for f in findings)
             blocks.append(
-                f"<div class='failures'><strong>GPU health{suffix}: "
+                f"<div class='failures'>"
+                f"<strong onclick='toggleFailureBlock(this)'>"
+                f"<span class='toggle-arrow'>▼</span> GPU health{suffix}: "
                 f"{len(findings)} finding(s) requiring attention</strong>"
+                f"<div class='failures-body'>"
                 f"<p class='caption'>Uncorrectable ECC errors and retired pages are RMA "
                 f"indicators; a degraded PCIe link or active throttling will cap "
-                f"achievable performance.</p><ul>{rows}</ul></div>"
+                f"achievable performance.</p><ul>{rows}</ul>"
+                f"</div></div>"
             )
         else:
             blocks.append(
@@ -1415,6 +1423,22 @@ def generate_comparison_html(file1_path: Optional[Path], file2_path: Optional[Pa
             font-size: 0.9rem;
         }}
 
+        .failures > strong {{
+            cursor: pointer;
+            display: block;
+            user-select: none;
+        }}
+
+        .toggle-arrow {{
+            display: inline-block;
+            width: 1em;
+            font-size: 0.8em;
+        }}
+
+        .failures.collapsed .failures-body {{
+            display: none;
+        }}
+
         .failures ul {{
             margin: 8px 0 0 18px;
         }}
@@ -1784,6 +1808,17 @@ def generate_comparison_html(file1_path: Optional[Path], file2_path: Optional[Pa
 
         function toggleCard(header) {{
             header.parentElement.classList.toggle('collapsed');
+        }}
+
+        // Shared by the red .failures and green .health-ok banners: the heading
+        // and caption stay visible, only the list of individual findings collapses.
+        function toggleFailureBlock(header) {{
+            const block = header.parentElement;
+            block.classList.toggle('collapsed');
+            const arrow = header.querySelector('.toggle-arrow');
+            if (arrow) {{
+                arrow.textContent = block.classList.contains('collapsed') ? '▶' : '▼';
+            }}
         }}
 
         // Space/Enter on a focused header, since the header is a div with

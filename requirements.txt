@@ -1,0 +1,4 @@
+# Only needed to run the web console (rapido-console.py). rapido-collect.py
+# and rapido-report.py have no third-party dependencies.
+flask
+paramiko

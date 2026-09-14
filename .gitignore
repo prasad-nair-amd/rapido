@@ -11,3 +11,11 @@ __pycache__/
 
 # Collected data and generated reports
 serverinfo_*.json
+
+# Web console per-job scratch output (retrieved JSON + generated reports)
+console_runs/
+
+# Local scratch/tooling, not part of the repo
+.audit/
+.tmp-verify/
+.claude/
